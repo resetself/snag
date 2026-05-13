@@ -1194,7 +1194,6 @@ fn download(
     url: []const u8,
     path: []const u8,
 ) !void {
-    // download to temp file first, then move to final path
     const basename = std.fs.path.basename(path);
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.snag-tmp", .{basename});
     defer allocator.free(tmp_path);
@@ -1220,10 +1219,14 @@ fn download(
         return err;
     };
 
-    // download succeeded — now create target dir and move
     try ensureParentDir(io, path);
-    try std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io);
+    std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io) catch |err| {
+        std.debug.print("error: cannot move to {s}: {}\n", .{ path, err });
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        return err;
+    };
 }
+
 
 // ============================================================================
 // EXTRACT
