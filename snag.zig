@@ -1120,6 +1120,9 @@ fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, pat
 
     const label = std.fs.path.basename(path);
     const started = nowMonotonicMs(io);
+    var downloaded: usize = 0;
+    var next_report: usize = 512 * 1024;
+    var last_report_ms: i64 = started;
 
     while (true) {
         const n = reader.readSliceShort(&read_buf) catch |err| switch (err) {
@@ -1127,7 +1130,22 @@ fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, pat
         };
         if (n == 0) break;
         try fw.interface.writeAll(read_buf[0..n]);
-        _ = total;
+        downloaded += n;
+
+        const now = nowMonotonicMs(io);
+        if (downloaded >= next_report or now - last_report_ms > 200) {
+            next_report = downloaded + 512 * 1024;
+            last_report_ms = now;
+            const elapsed = @as(f64, @floatFromInt(now - started)) / 1000.0;
+            const mb = fmtSize(downloaded);
+            const spd = if (elapsed > 0) mb / elapsed else 0;
+            if (total) |t| {
+                const pct = if (t > 0) (@as(f64, @floatFromInt(downloaded)) * 100.0 / @as(f64, @floatFromInt(t))) else 100.0;
+                std.debug.print("\r  {s}: {d:.1}% ({d:.2}/{d:.2} MB) {d:.1} MB/s", .{ label, pct, mb, fmtSize(t), spd });
+            } else {
+                std.debug.print("\r  {s}: {d:.2} MB {d:.1} MB/s", .{ label, mb, spd });
+            }
+        }
     }
 
     try fw.interface.flush();
@@ -1136,7 +1154,7 @@ fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, pat
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
     const size = try file.stat(io);
     const speed = if (elapsed_s > 0) fmtSize(size.size) / elapsed_s else 0;
-    std.debug.print("Downloaded: {s} ({d:.2} MB in {d:.1}s, {d:.2} MB/s)\n", .{ label, fmtSize(size.size), elapsed_s, speed });
+    std.debug.print("\r  {s}: {d:.2} MB {d:.1} MB/s\n", .{ label, fmtSize(size.size), speed });
 }
 
 fn download(
