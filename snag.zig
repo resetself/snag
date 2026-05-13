@@ -1459,12 +1459,26 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("No packages installed.\n", .{});
             return;
         }
-        std.debug.print("\n  {s}  {s:>12}  {s}\n", .{ "REPO", "VERSION", "INSTALLED" });
-        std.debug.print("  {s}  {s:>12}  {s}\n", .{ "----", "-------", "---------" });
+        // find max repo name width
+        var max_width: usize = "REPO".len;
+        {
+            var it = state.records.iterator();
+            while (it.next()) |entry| {
+                if (entry.key_ptr.*.len > max_width) max_width = entry.key_ptr.*.len;
+            }
+        }
+        // print header
+        var hdr_buf: [64]u8 = undefined;
+        const repo_hdr = try std.fmt.bufPrint(&hdr_buf, "{s}", .{"REPO"});
+        var pad_buf: [64]u8 = undefined;
+        @memset(pad_buf[0..@min(pad_buf.len, max_width)], ' ');
+        const pad = pad_buf[0..max_width];
+        std.debug.print("\n  {s}{s}  {s:>7}  {s}\n", .{ repo_hdr, pad[repo_hdr.len..], "VERSION", "INSTALLED" });
+        std.debug.print("  {s}{s}  {s:>7}  {s}\n", .{ "----", pad["----".len..], "-------", "---------" });
         var it = state.records.iterator();
         while (it.next()) |entry| {
             const rec = entry.value_ptr;
-            std.debug.print("  {s}  {s:>12}  {s}\n", .{ entry.key_ptr.*, rec.installed_version, rec.installed_at });
+            std.debug.print("  {s}{s}  {s:>7}  {s}\n", .{ entry.key_ptr.*, pad[entry.key_ptr.*.len..], rec.installed_version, rec.installed_at });
         }
         std.debug.print("\n", .{});
         return;
