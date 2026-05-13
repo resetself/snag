@@ -40,10 +40,10 @@ add_path() {
 
 SHELL_NAME=$(basename "${SHELL:-$SHELL}")
 case "$SHELL_NAME" in
-    fish) add_path "${HOME}/.config/fish/config.fish" "fish_add_path \$HOME/.local/snag/bin" ;;
-    zsh)  add_path "${HOME}/.zshrc"    "export PATH=\"\$HOME/.local/snag/bin:\$PATH\"" ;;
-    bash) add_path "${HOME}/.bashrc"   "export PATH=\"\$HOME/.local/snag/bin:\$PATH\"" ;;
-    *)    add_path "${HOME}/.profile"  "export PATH=\"\$HOME/.local/snag/bin:\$PATH\"" ;;
+    fish) add_path "${HOME}/.config/fish/config.fish" 'fish_add_path $HOME/.local/snag/bin' ;;
+    zsh)  add_path "${HOME}/.zshrc"    'export PATH="$HOME/.local/snag/bin:$PATH"' ;;
+    bash) add_path "${HOME}/.bashrc"   'export PATH="$HOME/.local/snag/bin:$PATH"' ;;
+    *)    add_path "${HOME}/.profile"  'export PATH="$HOME/.local/snag/bin:$PATH"' ;;
 esac
 
 echo ""
