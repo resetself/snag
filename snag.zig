@@ -1205,7 +1205,9 @@ fn download(
     if (use_proxy) try client.initDefaultProxies(allocator, environ_map);
 
     downloadWithClient(&client, io, url, tmp_path) catch |err| {
-        if (use_proxy) {
+        if (err == error.HttpConnectionClosing) {
+            // file was fully downloaded, connection close is benign
+        } else if (use_proxy) {
             var client2 = std.http.Client{ .allocator = allocator, .io = io };
             defer client2.deinit();
             configureHttpClient(&client2);
@@ -1214,9 +1216,10 @@ fn download(
                 return e2;
             };
             return err;
+        } else {
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+            return err;
         }
-        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-        return err;
     };
 
     try ensureParentDir(io, path);
