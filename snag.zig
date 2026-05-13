@@ -523,6 +523,7 @@ fn fetchJsonWithClient(client: *std.http.Client, allocator: std.mem.Allocator, u
     const result = try client.fetch(.{
         .location = .{ .url = url },
         .response_writer = &aw.writer,
+        .headers = .{ .user_agent = .{ .override = "snag/1.0" } },
     });
 
     if (result.status != .ok) {
@@ -1092,7 +1093,10 @@ fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, pat
     var req = try client.request(.GET, uri, .{
         .redirect_behavior = @enumFromInt(3),
         .keep_alive = false,
-        .headers = .{ .accept_encoding = .{ .override = "identity" } },
+        .headers = .{
+            .accept_encoding = .{ .override = "identity" },
+            .user_agent = .{ .override = "snag/1.0" },
+        },
     });
     defer req.deinit();
     try req.sendBodiless();
