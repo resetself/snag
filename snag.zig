@@ -1080,111 +1080,25 @@ fn tryUpdateMatch(
     return null;
 }
 
-// ============================================================================
-// DOWNLOAD
-// ============================================================================
-
-const DownloadProgress = struct {
-    label: []const u8,
-    total: ?u64,
-    downloaded: u64 = 0,
-    next_report_at: u64 = 0,
-    started_at_ms: i64,
-    last_rendered_at_ms: i64,
-
-    fn init(io: std.Io, path: []const u8, total: ?u64) DownloadProgress {
-        const now_ms = nowMonotonicMs(io);
-        return .{
-            .label = std.fs.path.basename(path),
-            .total = total,
-            .started_at_ms = now_ms,
-            .last_rendered_at_ms = now_ms,
-        };
-    }
-
-    fn advance(self: *DownloadProgress, io: std.Io, amount: usize) void {
-        self.downloaded += amount;
-        const now_ms = nowMonotonicMs(io);
-        if (self.downloaded < self.next_report_at and now_ms - self.last_rendered_at_ms < 200) return;
-        self.next_report_at = self.downloaded + 512 * 1024;
-        self.render(now_ms, false);
-    }
-
-    fn finish(self: *DownloadProgress, io: std.Io) void {
-        self.render(nowMonotonicMs(io), true);
-    }
-
-    fn render(self: *DownloadProgress, now_ms: i64, done: bool) void {
-        self.last_rendered_at_ms = now_ms;
-        const elapsed_ms = @max(now_ms - self.started_at_ms, 1);
-        const speed_mbps = (@as(f64, @floatFromInt(self.downloaded)) / 1024.0 / 1024.0) /
-            (@as(f64, @floatFromInt(elapsed_ms)) / 1000.0);
-
-        if (self.total) |total| {
-            const percent = if (total == 0)
-                100.0
-            else
-                (@as(f64, @floatFromInt(self.downloaded)) * 100.0) / @as(f64, @floatFromInt(total));
-            std.debug.print(
-                "\rDownloading {s}: {d:.2}/{d:.2} MB ({d:.1}%) {d:.2} MB/s",
-                .{ self.label, fmtSize(self.downloaded), fmtSize(total), percent, speed_mbps },
-            );
-        } else {
-            std.debug.print(
-                "\rDownloading {s}: {d:.2} MB {d:.2} MB/s",
-                .{ self.label, fmtSize(self.downloaded), speed_mbps },
-            );
-        }
-        if (done) std.debug.print("\n", .{});
-    }
-};
-
 fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, path: []const u8) !void {
-    const uri = try std.Uri.parse(url);
-    var req = try client.request(.GET, uri, .{
-        .redirect_behavior = @enumFromInt(3),
-        .headers = .{
-            .accept_encoding = .{ .override = "identity" },
-        },
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+
+    var fb: [256 * 1024]u8 = undefined;
+    var fw = file.writerStreaming(io, &fb);
+
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &fw.interface,
     });
-    defer req.deinit();
-    try req.sendBodiless();
 
-    var redirect_buf: [8192]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-
-    if (response.head.status != .ok) {
-        std.debug.print("HTTP {d} for {s}\n", .{ @intFromEnum(response.head.status), url });
+    if (result.status != .ok) {
+        std.debug.print("HTTP {d} for {s}\n", .{ @intFromEnum(result.status), url });
         return error.HttpError;
     }
 
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-
-    var file_buf: [256 * 1024]u8 = undefined;
-    var file_writer = file.writerStreaming(io, &file_buf);
-
-    var transfer_buf: [64 * 1024]u8 = undefined;
-    var decompress_buf: [64 * 1024]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
-    var read_buf: [256 * 1024]u8 = undefined;
-    const progress_total = if (response.head.content_encoding == .identity) response.head.content_length else null;
-    var progress = DownloadProgress.init(io, path, progress_total);
-
-    while (true) {
-        const n = reader.readSliceShort(&read_buf) catch |err| switch (err) {
-            error.ReadFailed => return response.bodyErr().?,
-            else => |e| return e,
-        };
-        if (n == 0) break;
-        try file_writer.interface.writeAll(read_buf[0..n]);
-        progress.advance(io, n);
-    }
-
-    try file_writer.interface.flush();
-    progress.finish(io);
-    std.debug.print("Downloaded: {s} ({d:.2} MB)\n", .{ path, fmtSize(progress.downloaded) });
+    try fw.interface.flush();
+    std.debug.print("Downloaded: {s}\n", .{path});
 }
 
 fn download(
@@ -1205,9 +1119,7 @@ fn download(
     if (use_proxy) try client.initDefaultProxies(allocator, environ_map);
 
     downloadWithClient(&client, io, url, tmp_path) catch |err| {
-        if (err == error.HttpConnectionClosing) {
-            // file was fully downloaded, connection close is benign
-        } else if (use_proxy) {
+        if (use_proxy) {
             var client2 = std.http.Client{ .allocator = allocator, .io = io };
             defer client2.deinit();
             configureHttpClient(&client2);
@@ -1215,7 +1127,6 @@ fn download(
                 std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
                 return e2;
             };
-            return err;
         } else {
             std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
             return err;
