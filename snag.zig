@@ -1670,7 +1670,20 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("Downloading: {s}\n", .{candidate.browser_download_url});
             try download(allocator, io, environ_map, candidate.browser_download_url, output_path);
             std.debug.print("Extracting...\n", .{});
-            try extract(allocator, io, output_path, if (args.output) |_| args.output else null);
+            if (args.output) |out| {
+                try extract(allocator, io, output_path, out);
+            } else {
+                // create dir named after archive (strip extension(s))
+                var ext_dir = basename;
+                if (std.ascii.endsWithIgnoreCase(ext_dir, ".tar.gz")) ext_dir = ext_dir[0..ext_dir.len-7];
+                if (std.ascii.endsWithIgnoreCase(ext_dir, ".tar.xz")) ext_dir = ext_dir[0..ext_dir.len-7];
+                if (std.ascii.endsWithIgnoreCase(ext_dir, ".tgz")) ext_dir = ext_dir[0..ext_dir.len-4];
+                if (std.ascii.endsWithIgnoreCase(ext_dir, ".zip")) ext_dir = ext_dir[0..ext_dir.len-4];
+                if (std.ascii.endsWithIgnoreCase(ext_dir, ".xz")) ext_dir = ext_dir[0..ext_dir.len-3];
+                const ext_path = try std.fs.path.join(allocator, &.{ output_dir, ext_dir });
+                defer allocator.free(ext_path);
+                try extract(allocator, io, output_path, ext_path);
+            }
         } else {
             std.debug.print("Downloading: {s}\n", .{candidate.browser_download_url});
             try download(allocator, io, environ_map, candidate.browser_download_url, output_path);
