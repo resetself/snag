@@ -1,3 +1,13 @@
+# Zig build artifacts
 .zig-cache/
+.zig-global-cache/
 zig-out/
-*.o
+
+# Build output
+/snag
+/snag.exe
+
+# IDE
+.vscode/
+.idea/
+.DS_Store

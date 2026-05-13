@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux
+            os: ubuntu-latest
+            binary: snag-x86_64-linux
+          - target: aarch64-linux
+            os: ubuntu-latest
+            binary: snag-aarch64-linux
+          - target: x86_64-macos
+            os: macos-latest
+            binary: snag-x86_64-macos
+          - target: aarch64-macos
+            os: macos-latest
+            binary: snag-aarch64-macos
+          - target: x86_64-windows
+            os: windows-latest
+            binary: snag-x86_64-windows.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Rename (Unix)
+        if: runner.os != 'Windows'
+        run: mv zig-out/bin/snag ${{ matrix.binary }}
+
+      - name: Rename (Windows)
+        if: runner.os == 'Windows'
+        run: mv zig-out/bin/snag.exe ${{ matrix.binary }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: ${{ matrix.binary }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          find . -type f -exec sha256sum {} \; > checksums.txt
+          cat checksums.txt
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/*/*
+            artifacts/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
