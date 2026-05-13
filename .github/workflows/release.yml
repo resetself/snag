@@ -25,7 +25,7 @@ jobs:
           - target: aarch64-macos
             os: macos-latest
             binary: snag-aarch64-macos
-          - target: x86_64-windows
+          - target: x86_64-windows-gnu
             os: windows-latest
             binary: snag-x86_64-windows.exe
 
@@ -47,7 +47,7 @@ jobs:
 
       - name: Rename (Windows)
         if: runner.os == 'Windows'
-        run: mv zig-out/bin/snag.exe ${{ matrix.binary }}
+        run: Move-Item zig-out/bin/snag.exe ${{ matrix.binary }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
