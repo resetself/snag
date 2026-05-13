@@ -1223,11 +1223,7 @@ fn download(
     };
 
     try ensureParentDir(io, path);
-    std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io) catch |err| {
-        std.debug.print("error: cannot move to {s}: {}\n", .{ path, err });
-        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-        return err;
-    };
+    try std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io);
 }
 
 
