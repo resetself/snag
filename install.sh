@@ -24,13 +24,13 @@ echo "→ Installing snag (${ARCH_NAME}-${PLATFORM})..."
 mkdir -p "$BIN_DIR"
 curl -fsSL "$URL" -o "${BIN_DIR}/snag"
 chmod +x "${BIN_DIR}/snag"
-echo "✓ snag → ${BIN_DIR}/snag"
+echo "✓ snag → ~/.local/snag/bin/snag"
 
 # Add to PATH
 add_path() {
     local config="$1"
     local line="$2"
-    if [ -f "$config" ] && grep -qF "$BIN_DIR" "$config" 2>/dev/null; then
+    if [ -f "$config" ] && grep -qF '.local/snag/bin' "$config" 2>/dev/null; then
         return
     fi
     mkdir -p "$(dirname "$config")"
@@ -40,10 +40,10 @@ add_path() {
 
 SHELL_NAME=$(basename "${SHELL:-$SHELL}")
 case "$SHELL_NAME" in
-    fish) add_path "${HOME}/.config/fish/config.fish" "fish_add_path ${BIN_DIR}" ;;
-    zsh)  add_path "${HOME}/.zshrc"    "export PATH=\"${BIN_DIR}:\$PATH\"" ;;
-    bash) add_path "${HOME}/.bashrc"   "export PATH=\"${BIN_DIR}:\$PATH\"" ;;
-    *)    add_path "${HOME}/.profile"  "export PATH=\"${BIN_DIR}:\$PATH\"" ;;
+    fish) add_path "${HOME}/.config/fish/config.fish" "fish_add_path \$HOME/.local/snag/bin" ;;
+    zsh)  add_path "${HOME}/.zshrc"    "export PATH=\"\$HOME/.local/snag/bin:\$PATH\"" ;;
+    bash) add_path "${HOME}/.bashrc"   "export PATH=\"\$HOME/.local/snag/bin:\$PATH\"" ;;
+    *)    add_path "${HOME}/.profile"  "export PATH=\"\$HOME/.local/snag/bin:\$PATH\"" ;;
 esac
 
 echo ""
