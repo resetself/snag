@@ -1087,29 +1087,53 @@ fn tryUpdateMatch(
 }
 
 fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, path: []const u8) !void {
+    const uri = try std.Uri.parse(url);
+    var req = try client.request(.GET, uri, .{
+        .redirect_behavior = @enumFromInt(3),
+        .keep_alive = false,
+        .headers = .{ .accept_encoding = .{ .override = "identity" } },
+    });
+    defer req.deinit();
+    try req.sendBodiless();
+
+    var redirect_buf: [8192]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+
+    if (response.head.status != .ok) {
+        std.debug.print("HTTP {d} for {s}\n", .{ @intFromEnum(response.head.status), url });
+        return error.HttpError;
+    }
+
     const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
     defer file.close(io);
 
     var fb: [256 * 1024]u8 = undefined;
     var fw = file.writerStreaming(io, &fb);
 
+    var transfer_buf: [64 * 1024]u8 = undefined;
+    var decompress_buf: [64 * 1024]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
+    var read_buf: [256 * 1024]u8 = undefined;
+    const total = if (response.head.content_encoding == .identity) response.head.content_length else null;
+
     const label = std.fs.path.basename(path);
     const started = nowMonotonicMs(io);
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &fw.interface,
-    });
-    const elapsed_ms = @max(nowMonotonicMs(io) - started, 1);
 
-    if (result.status != .ok) {
-        std.debug.print("HTTP {d} for {s}\n", .{ @intFromEnum(result.status), url });
-        return error.HttpError;
+    while (true) {
+        const n = reader.readSliceShort(&read_buf) catch |err| switch (err) {
+            error.ReadFailed => return response.bodyErr().?,
+        };
+        if (n == 0) break;
+        try fw.interface.writeAll(read_buf[0..n]);
+        _ = total;
     }
 
     try fw.interface.flush();
 
-    const size = try file.stat(io);
+    const elapsed_ms = @max(nowMonotonicMs(io) - started, 1);
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
+    const size = try file.stat(io);
     const speed = if (elapsed_s > 0) fmtSize(size.size) / elapsed_s else 0;
     std.debug.print("Downloaded: {s} ({d:.2} MB in {d:.1}s, {d:.2} MB/s)\n", .{ label, fmtSize(size.size), elapsed_s, speed });
 }
