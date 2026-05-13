@@ -668,12 +668,7 @@ const Key = union(enum) {
 
 fn readKey() !Key {
     var buf: [3]u8 = undefined;
-    const n = if (builtin.os.tag == .windows) blk: {
-        var nread: std.os.windows.DWORD = 0;
-        const handle = std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) orelse return error.Eof;
-        _ = std.os.windows.kernel32.ReadFile(handle, &buf, @intCast(buf.len), &nread, null);
-        break :blk @as(usize, nread);
-    } else try std.posix.read(0, &buf);
+    const n = try std.posix.read(0, &buf);
     if (n == 0) return error.Eof;
     if (buf[0] == '\x1b') {
         if (buf[1] == '[') {
@@ -689,6 +684,34 @@ fn readKey() !Key {
     if (buf[0] == '\t') return .tab;
     if (buf[0] == 127 or buf[0] == 8) return .backspace;
     return .{ .char = buf[0] };
+}
+
+fn readLineSimple(allocator: std.mem.Allocator) !?[]const u8 {
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    while (pos < buf.len) {
+        const byte = if (builtin.os.tag == .windows) blk: {
+            var nread: std.os.windows.DWORD = 0;
+            var ch: u8 = undefined;
+            const stdin_handle = std.os.windows.kernel32.GetStdHandle(0xFFFFFFF6) orelse break;
+            if (std.os.windows.kernel32.ReadFile(stdin_handle, &ch, 1, &nread, null) == 0) break;
+            if (nread == 0) break;
+            break :blk ch;
+        } else blk: {
+            var ch: u8 = undefined;
+            const n = std.posix.read(0, (&ch)[0..1]) catch break;
+            if (n == 0) break;
+            break :blk ch;
+        };
+        if (byte == '\n') break;
+        if (byte == '\r') continue;
+        buf[pos] = byte;
+        pos += 1;
+    }
+    if (pos == 0) return null;
+    const trimmed = std.mem.trim(u8, buf[0..pos], " \t");
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
 }
 
 const RawTerm = if (builtin.os.tag == .windows)
@@ -793,10 +816,36 @@ fn applyFilter(
     if (cursor.* >= cnt and cnt > 0) cursor.* = cnt - 1;
 }
 
+fn interactiveSelectWindows(
+    allocator: std.mem.Allocator,
+    all_candidates: []const AssetCandidate,
+) !?usize {
+    for (all_candidates, 0..) |c, i| {
+        std.debug.print("  {d}. {s}\n", .{ i + 1, c.name });
+    }
+    std.debug.print("\n  Enter number (q to quit): ", .{});
+    const line = try readLineSimple(allocator) orelse return null;
+    defer allocator.free(line.?);
+    const input = line.?;
+    if (std.ascii.eqlIgnoreCase(input, "q")) return null;
+    const num = std.fmt.parseUnsigned(usize, input, 10) catch {
+        std.debug.print("  Invalid input\n", .{});
+        return null;
+    };
+    if (num < 1 or num > all_candidates.len) {
+        std.debug.print("  Out of range\n", .{});
+        return null;
+    }
+    return num - 1;
+}
+
 fn interactiveSelect(
     allocator: std.mem.Allocator,
     all_candidates: []const AssetCandidate,
 ) !?usize {
+    if (builtin.os.tag == .windows) {
+        return interactiveSelectWindows(allocator, all_candidates);
+    }
     if (all_candidates.len == 0) {
         std.debug.print("No candidates to select from.\n", .{});
         return null;
