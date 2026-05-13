@@ -26,6 +26,7 @@ const InstallRecord = struct {
     selected_download_url: []const u8,
     install_mode: []const u8, // "archive_extract" or "raw_file"
     install_type: []const u8, // "bin" or "custom"
+    installed_files: []const u8, // newline-separated filenames
     selected_match_keyword: ?[]const u8,
     selected_os_arch: ?[]const u8,
     installed_at: []const u8,
@@ -47,6 +48,7 @@ const StateFile = struct {
             self.allocator.free(entry.value_ptr.selected_download_url);
             self.allocator.free(entry.value_ptr.install_mode);
             self.allocator.free(entry.value_ptr.install_type);
+            self.allocator.free(entry.value_ptr.installed_files);
             if (entry.value_ptr.selected_match_keyword) |kw| self.allocator.free(kw);
             if (entry.value_ptr.selected_os_arch) |os| self.allocator.free(os);
             self.allocator.free(entry.value_ptr.installed_at);
@@ -909,6 +911,7 @@ fn parseInstallRecord(allocator: std.mem.Allocator, value: std.json.Value) !Inst
         .selected_download_url = try allocator.dupe(u8, getStringField(obj, "selected_download_url") orelse return error.InvalidStateFormat),
         .install_mode = try allocator.dupe(u8, getStringField(obj, "install_mode") orelse return error.InvalidStateFormat),
         .install_type = try allocator.dupe(u8, getStringField(obj, "install_type") orelse "bin"),
+        .installed_files = try allocator.dupe(u8, getStringField(obj, "installed_files") orelse ""),
         .selected_match_keyword = if (getStringField(obj, "selected_match_keyword")) |kw| try allocator.dupe(u8, kw) else null,
         .selected_os_arch = if (getStringField(obj, "selected_os_arch")) |osa| try allocator.dupe(u8, osa) else null,
         .installed_at = try allocator.dupe(u8, getStringField(obj, "installed_at") orelse return error.InvalidStateFormat),
@@ -930,6 +933,7 @@ fn freeRecordFields(allocator: std.mem.Allocator, rec: *InstallRecord) void {
     allocator.free(rec.selected_download_url);
     allocator.free(rec.install_mode);
     allocator.free(rec.install_type);
+    allocator.free(rec.installed_files);
     if (rec.selected_match_keyword) |kw| allocator.free(kw);
     if (rec.selected_os_arch) |os| allocator.free(os);
     allocator.free(rec.installed_at);
@@ -957,7 +961,8 @@ fn saveState(state: *const StateFile, io: std.Io, state_path: []const u8) !void 
             \\    "selected_asset_name": "{s}",
             \\    "selected_download_url": "{s}",
             \\    "install_mode": "{s}",
-            \\    "install_type": "{s}"
+            \\    "install_type": "{s}",
+            \\    "installed_files": "{s}"
         , .{
             entry.key_ptr.*,
             rec.repo_url,
@@ -968,6 +973,7 @@ fn saveState(state: *const StateFile, io: std.Io, state_path: []const u8) !void 
             rec.selected_download_url,
             rec.install_mode,
             rec.install_type,
+            rec.installed_files,
         });
 
         if (rec.selected_match_keyword) |kw| {
@@ -1482,10 +1488,18 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Removing {s} ({s})...\n", .{ repo_key, record.installed_version });
 
         if (std.mem.eql(u8, record.install_type, "custom")) {
-            // custom path — delete the entire directory
             std.Io.Dir.cwd().deleteTree(io, record.install_dir) catch |err| {
                 std.debug.print("  (warning: could not clean {s}: {})\n", .{ record.install_dir, err });
             };
+        } else if (record.installed_files.len > 0) {
+            // bin install — delete only recorded files
+            var file_iter = std.mem.splitScalar(u8, record.installed_files, '\n');
+            while (file_iter.next()) |name| {
+                if (name.len == 0) continue;
+                const fp = try std.fs.path.join(allocator, &.{ record.install_dir, name });
+                defer allocator.free(fp);
+                std.Io.Dir.cwd().deleteFile(io, fp) catch {};
+            }
         }
 
         // Remove from state (fetchRemove returns KV and removes, we must free manually)
@@ -1544,7 +1558,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("Updating {s} to {s}...\n", .{ repo_key, c.release_tag });
             const do_clean = std.mem.eql(u8, record.install_type, "bin");
             try installAsset(allocator, io, environ_map, c, record.install_dir, do_clean);
-            try writeInstallRecord(allocator, io, &state, state_path, repo_key, args, c, record.install_dir, record.install_type);
+            try writeInstallRecord(allocator, io, &state, state_path, repo_key, args, c, record.install_dir, record.install_type, null);
             std.debug.print("Updated {s} to {s}\n", .{ repo_key, c.release_tag });
             return;
         }
@@ -1556,7 +1570,7 @@ pub fn main(init: std.process.Init) !void {
                 const c = candidates[i];
                 const do_clean2 = std.mem.eql(u8, record.install_type, "bin");
                 try installAsset(allocator, io, environ_map, c, record.install_dir, do_clean2);
-                try writeInstallRecord(allocator, io, &state, state_path, repo_key, args, c, record.install_dir, record.install_type);
+                try writeInstallRecord(allocator, io, &state, state_path, repo_key, args, c, record.install_dir, record.install_type, null);
                 std.debug.print("Updated {s} to {s}\n", .{ repo_key, c.release_tag });
                 return;
             }
@@ -1615,14 +1629,61 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(install_dir);
 
     const is_custom_install = args.extract;
+    // Snapshot files before install (bin type only, for diff)
+    const before_files = if (!is_custom_install) try listFileNames(allocator, io, install_dir) else null;
+    defer if (before_files) |bf| allocator.free(bf);
+
     try installAsset(allocator, io, environ_map, candidate, install_dir, !is_custom_install);
 
     const slug = try parseRepoSlug(args.url.?);
     const repo_key = try slugKey(slug, allocator);
     defer allocator.free(repo_key);
 
-    try writeInstallRecord(allocator, io, null, state_path, repo_key, args, candidate, install_dir, if (is_custom_install) "custom" else "bin");
+    try writeInstallRecord(allocator, io, null, state_path, repo_key, args, candidate, install_dir, if (is_custom_install) "custom" else "bin", before_files);
     std.debug.print("Installed {s} to {s}\n", .{ candidate.release_tag, install_dir });
+}
+
+fn listFileNames(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![]const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+
+    if (std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true })) |dir| {
+        defer dir.close(io);
+        var iter = dir.iterate();
+        while (try iter.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            try names.append(allocator, try allocator.dupe(u8, entry.name));
+        }
+    } else |_| {}
+
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
+    for (names.items, 0..) |name, i| {
+        if (i > 0) try result.append(allocator, '\n');
+        try result.appendSlice(allocator, name);
+    }
+    return try result.toOwnedSlice(allocator);
+}
+
+fn diffNewFiles(allocator: std.mem.Allocator, before: []const u8, after: []const u8) ![]const u8 {
+    var result: std.ArrayList(u8) = .empty;
+    var after_iter = std.mem.splitScalar(u8, after, '\n');
+    while (after_iter.next()) |name| {
+        if (name.len == 0) continue;
+        var before_iter = std.mem.splitScalar(u8, before, '\n');
+        var found = false;
+        while (before_iter.next()) |bname| {
+            if (std.mem.eql(u8, name, bname)) { found = true; break; }
+        }
+        if (!found) {
+            if (result.items.len > 0) try result.append(allocator, '\n');
+            try result.appendSlice(allocator, name);
+        }
+    }
+    return try result.toOwnedSlice(allocator);
 }
 
 fn writeInstallRecord(
@@ -1635,9 +1696,16 @@ fn writeInstallRecord(
     candidate: AssetCandidate,
     install_dir: []const u8,
     install_type: []const u8,
+    before_files: ?[]const u8,
 ) !void {
     const now_str = try nowUtcString(allocator, io);
     defer allocator.free(now_str);
+
+    const files = if (before_files) |bf| blk: {
+        const after = try listFileNames(allocator, io, install_dir);
+        defer allocator.free(after);
+        break :blk try diffNewFiles(allocator, bf, after);
+    } else try listFileNames(allocator, io, install_dir);
 
     const record = InstallRecord{
         .repo_url = try allocator.dupe(u8, args.url.?),
@@ -1648,6 +1716,7 @@ fn writeInstallRecord(
         .selected_download_url = try allocator.dupe(u8, candidate.browser_download_url),
         .install_mode = try allocator.dupe(u8, if (isCompressedFormat(candidate.name)) "archive_extract" else "raw_file"),
         .install_type = try allocator.dupe(u8, install_type),
+        .installed_files = files,
         .selected_match_keyword = if (args.match_keyword) |kw| try allocator.dupe(u8, kw) else null,
         .selected_os_arch = if (args.os_arch) |osa| try allocator.dupe(u8, osa) else null,
         .installed_at = try allocator.dupe(u8, now_str),
