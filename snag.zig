@@ -394,6 +394,7 @@ fn validateArgs(args: Args) !void {
         return error.HelpRequested;
     }
     if (args.cmd == .list) return;
+    if (args.cmd == .update and args.url == null) return; // update all
     if (args.url == null) {
         usage();
         std.debug.print("\nerror: repository required\n", .{});
@@ -1387,6 +1388,66 @@ fn installAsset(
 // MAIN
 // ============================================================================
 
+fn updateOne(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+    state: *StateFile,
+    state_path: []const u8,
+    repo_key: []const u8,
+    args: Args,
+) !void {
+    const record = findRecord(state, repo_key) orelse return error.NoInstallRecord;
+    std.debug.print("Checking {s}...\n", .{repo_key});
+
+    const api_url = repoApiUrl(allocator, record.repo_url, args.version) catch
+        try repoApiUrl(allocator, repo_key, args.version);
+    defer allocator.free(api_url);
+
+    const json = try fetchJson(allocator, io, environ_map, api_url);
+    defer allocator.free(json);
+
+    const parsed = try parseRelease(allocator, json);
+    defer parsed.deinit();
+    const release = parsed.value;
+
+    const auto_detect = args.os_arch == null and record.selected_os_arch == null;
+    const platform = if (auto_detect) currentPlatformHints() else null;
+    const candidates = try collectCandidates(
+        allocator, release,
+        if (args.match_keyword) |_| args.match_keyword else record.selected_match_keyword,
+        if (args.os_arch) |_| args.os_arch else record.selected_os_arch,
+        platform,
+    );
+    defer allocator.free(candidates);
+
+    const selected_idx = tryUpdateMatch(candidates, record);
+    if (selected_idx) |idx| {
+        const c = candidates[idx];
+        std.debug.print("  {s} => {s}\n", .{ record.installed_version, c.release_tag });
+        if (std.mem.eql(u8, record.installed_version, c.release_tag)) {
+            std.debug.print("  (already up to date)\n", .{});
+            return;
+        }
+        const do_clean = std.mem.eql(u8, record.install_type, "bin");
+        try installAsset(allocator, io, environ_map, c, record.install_dir, do_clean);
+        try writeInstallRecord(allocator, io, state, state_path, repo_key, args, c, record.install_dir, record.install_type, "");
+        return;
+    }
+
+    if (args.interactive) {
+        std.debug.print("  Auto-match failed, entering interactive mode...\n", .{});
+        const idx = try interactiveSelect(allocator, candidates) orelse return;
+        const c = candidates[idx];
+        const do_clean = std.mem.eql(u8, record.install_type, "bin");
+        try installAsset(allocator, io, environ_map, c, record.install_dir, do_clean);
+        try writeInstallRecord(allocator, io, state, state_path, repo_key, args, c, record.install_dir, record.install_type, "");
+        return;
+    }
+
+    return error.AmbiguousMatch;
+}
+
 fn selectAssetIdx(
     allocator: std.mem.Allocator,
     candidates: []AssetCandidate,
@@ -1557,6 +1618,36 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // ---- UPDATE ALL ----
+    if (args.cmd == .update and args.url == null) {
+        var st = try loadState(allocator, io, state_path);
+        defer st.deinit();
+        if (st.records.count() == 0) {
+            std.debug.print("No packages installed.\n", .{});
+            return;
+        }
+        var keys: std.ArrayList([]const u8) = .empty;
+        {
+            var it = st.records.iterator();
+            while (it.next()) |entry| {
+                try keys.append(allocator, try allocator.dupe(u8, entry.key_ptr.*));
+            }
+        }
+        defer {
+            for (keys.items) |k| allocator.free(k);
+            keys.deinit(allocator);
+        }
+        for (keys.items) |key| {
+            std.debug.print("\n--- {s} ---\n", .{key});
+            updateOne(allocator, io, environ_map, &st, state_path, key, args) catch |err| {
+                std.debug.print("  failed: {}\n", .{err});
+            };
+        }
+        try saveState(&st, io, state_path);
+        std.debug.print("\nDone.\n", .{});
+        return;
+    }
+
     // ---- UPDATE ----
     if (args.cmd == .update) {
         var state = try loadState(allocator, io, state_path);
@@ -1572,59 +1663,8 @@ pub fn main(init: std.process.Init) !void {
         const repo_key = try allocator.dupe(u8, repo_key_raw);
         defer allocator.free(repo_key);
 
-        const record = findRecord(&state, repo_key).?;
-        std.debug.print("Fetching release info for {s}...\n", .{repo_key});
-
-        // Use the stored repo_url for the API call, fallback to repo_key
-        const api_url = repoApiUrl(allocator, record.repo_url, args.version) catch
-            try repoApiUrl(allocator, repo_key, args.version);
-        defer allocator.free(api_url);
-
-        const json = try fetchJson(allocator, io, environ_map, api_url);
-        defer allocator.free(json);
-
-        const parsed = try parseRelease(allocator, json);
-        defer parsed.deinit();
-        const release = parsed.value;
-
-        const auto_detect = args.os_arch == null and record.selected_os_arch == null;
-        const platform = if (auto_detect) currentPlatformHints() else null;
-        const candidates = try collectCandidates(
-            allocator, release,
-            if (args.match_keyword) |_| args.match_keyword else record.selected_match_keyword,
-            if (args.os_arch) |_| args.os_arch else record.selected_os_arch,
-            platform,
-        );
-        defer allocator.free(candidates);
-
-        const selected_idx = tryUpdateMatch(candidates, record);
-        if (selected_idx) |idx| {
-            const c = candidates[idx];
-            std.debug.print("Updating {s} to {s}...\n", .{ repo_key, c.release_tag });
-            const do_clean = std.mem.eql(u8, record.install_type, "bin");
-            try installAsset(allocator, io, environ_map, c, record.install_dir, do_clean);
-            try writeInstallRecord(allocator, io, &state, state_path, repo_key, args, c, record.install_dir, record.install_type, "");
-            std.debug.print("Updated {s} to {s}\n", .{ repo_key, c.release_tag });
-            return;
-        }
-
-        if (args.interactive) {
-            std.debug.print("Auto-match failed for update, entering interactive mode...\n", .{});
-            const idx = try interactiveSelect(allocator, candidates);
-            if (idx) |i| {
-                const c = candidates[i];
-                const do_clean2 = std.mem.eql(u8, record.install_type, "bin");
-                try installAsset(allocator, io, environ_map, c, record.install_dir, do_clean2);
-                try writeInstallRecord(allocator, io, &state, state_path, repo_key, args, c, record.install_dir, record.install_type, "");
-                std.debug.print("Updated {s} to {s}\n", .{ repo_key, c.release_tag });
-                return;
-            }
-            std.debug.print("Update cancelled.\n", .{});
-            return;
-        }
-
-        std.debug.print("error: ambiguous match for update. Use -i for interactive selection.\n", .{});
-        return error.AmbiguousMatch;
+        try updateOne(allocator, io, environ_map, &state, state_path, repo_key, args);
+        return;
     }
 
     // ---- INSTALL / DOWNLOAD (both need to fetch + select) ----
