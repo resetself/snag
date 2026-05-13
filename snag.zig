@@ -668,10 +668,15 @@ const Key = union(enum) {
 
 fn readKey() !Key {
     var buf: [3]u8 = undefined;
-    const n = try std.posix.read(0, &buf);
+    const n = if (builtin.os.tag == .windows) blk: {
+        var nread: std.os.windows.DWORD = 0;
+        const handle = std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) orelse return error.Eof;
+        _ = std.os.windows.kernel32.ReadFile(handle, &buf, @intCast(buf.len), &nread, null);
+        break :blk @as(usize, nread);
+    } else try std.posix.read(0, &buf);
     if (n == 0) return error.Eof;
     if (buf[0] == '\x1b') {
-        if (n >= 3 and buf[1] == '[') {
+        if (buf[1] == '[') {
             return switch (buf[2]) {
                 'A' => .up,
                 'B' => .down,
@@ -686,24 +691,30 @@ fn readKey() !Key {
     return .{ .char = buf[0] };
 }
 
-const RawTerm = struct {
-    orig: std.posix.termios,
-
-    fn enter() !RawTerm {
-        const orig = try std.posix.tcgetattr(0);
-        var raw = orig;
-        raw.lflag.ECHO = false;
-        raw.lflag.ICANON = false;
-        raw.cc[6] = 1; // VMIN
-        raw.cc[5] = 0; // VTIME
-        try std.posix.tcsetattr(0, .NOW, raw);
-        return RawTerm{ .orig = orig };
+const RawTerm = if (builtin.os.tag == .windows)
+    struct {
+        fn enter() !@This() { return .{}; }
+        fn exit(_: *@This()) void {}
     }
+else
+    struct {
+        orig: std.posix.termios,
 
-    fn exit(self: *RawTerm) void {
-        std.posix.tcsetattr(0, .NOW, self.orig) catch {};
-    }
-};
+        fn enter() !@This() {
+            const orig = try std.posix.tcgetattr(0);
+            var raw = orig;
+            raw.lflag.ECHO = false;
+            raw.lflag.ICANON = false;
+            raw.cc[6] = 1; // VMIN
+            raw.cc[5] = 0; // VTIME
+            try std.posix.tcsetattr(0, .NOW, raw);
+            return .{ .orig = orig };
+        }
+
+        fn exit(self: *@This()) void {
+            std.posix.tcsetattr(0, .NOW, self.orig) catch {};
+        }
+    };
 
 fn drawList(candidates: []const AssetCandidate, cursor: usize, filter: []const u8, prev_lines: *usize) void {
     if (prev_lines.* > 0) {
