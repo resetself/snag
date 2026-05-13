@@ -1263,6 +1263,43 @@ fn isCompressedFormat(name: []const u8) bool {
         std.ascii.endsWithIgnoreCase(name, ".xz");
 }
 
+fn flattenSingleDir(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var subdir_name: ?[]const u8 = null;
+    var file_count: usize = 0;
+    var iter = dir.iterate();
+    defer if (subdir_name) |n| allocator.free(n);
+    while (try iter.next(io)) |entry| {
+        if (entry.kind == .directory) {
+            if (subdir_name != null) return; // multiple dirs, don't flatten
+            subdir_name = try allocator.dupe(u8, entry.name);
+        } else {
+            file_count += 1;
+        }
+    }
+    // only flatten if exactly 1 dir and 0 files
+    if (subdir_name == null or file_count > 0) return;
+
+    const sub_path = try std.fs.path.join(allocator, &.{ dir_path, subdir_name.? });
+    defer allocator.free(sub_path);
+
+    // move everything from subdir up
+    var sub = try std.Io.Dir.cwd().openDir(io, sub_path, .{ .iterate = true });
+    defer sub.close(io);
+    var sub_iter = sub.iterate();
+    while (try sub_iter.next(io)) |entry| {
+        const src = try std.fs.path.join(allocator, &.{ sub_path, entry.name });
+        defer allocator.free(src);
+        const dst = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(dst);
+        try std.Io.Dir.rename(.cwd(), src, .cwd(), dst, io);
+    }
+    // remove now-empty subdir
+    try std.Io.Dir.cwd().deleteDir(io, sub_path);
+}
+
 fn extract(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1270,6 +1307,7 @@ fn extract(
     out_dir: ?[]const u8,
 ) !void {
     const cwd = std.Io.Dir.cwd();
+    const target = out_dir orelse ".";
 
     if (out_dir) |dir| {
         cwd.createDirPath(io, dir) catch |err| switch (err) {
@@ -1285,6 +1323,7 @@ fn extract(
             &[_][]const u8{ "tar", "-xJf", archive };
         try runCommand(allocator, io, argv);
         try cwd.deleteFile(io, archive);
+        if (out_dir != null) try flattenSingleDir(allocator, io, target);
     } else if (std.ascii.endsWithIgnoreCase(archive, ".tar.gz") or std.ascii.endsWithIgnoreCase(archive, ".tgz")) {
         const argv = if (out_dir) |dir|
             &[_][]const u8{ "tar", "-xzf", archive, "-C", dir }
@@ -1292,6 +1331,7 @@ fn extract(
             &[_][]const u8{ "tar", "-xzf", archive };
         try runCommand(allocator, io, argv);
         try cwd.deleteFile(io, archive);
+        if (out_dir != null) try flattenSingleDir(allocator, io, target);
     } else if (std.ascii.endsWithIgnoreCase(archive, ".zip")) {
         if (out_dir) |dir| {
             try runCommand(allocator, io, &.{ "unzip", "-o", archive, "-d", dir });
