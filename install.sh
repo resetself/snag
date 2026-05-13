@@ -35,7 +35,7 @@ add_path() {
     fi
     mkdir -p "$(dirname "$config")"
     echo "$line" >> "$config"
-    echo "✓ PATH added to ${config}"
+    echo "✓ PATH added to ~${config#$HOME}"
 }
 
 SHELL_NAME=$(basename "${SHELL:-$SHELL}")
