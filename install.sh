@@ -24,7 +24,7 @@ echo "→ Installing snag (${ARCH_NAME}-${PLATFORM})..."
 mkdir -p "$BIN_DIR"
 curl -fsSL "$URL" -o "${BIN_DIR}/snag"
 chmod +x "${BIN_DIR}/snag"
-echo "✓ snag → ~/.local/snag/bin/snag"
+echo "✓ snag → ~${BIN_DIR#$HOME}/snag"
 
 # Add to PATH
 add_path() {
@@ -35,7 +35,7 @@ add_path() {
     fi
     mkdir -p "$(dirname "$config")"
     echo "$line" >> "$config"
-    echo "✓ PATH added to ${config}"
+    echo "✓ PATH added to ~${config#$HOME}"
 }
 
 SHELL_NAME=$(basename "${SHELL:-$SHELL}")
