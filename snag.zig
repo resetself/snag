@@ -1481,10 +1481,12 @@ pub fn main(init: std.process.Init) !void {
         const record = findRecord(&state, repo_key).?;
         std.debug.print("Removing {s} ({s})...\n", .{ repo_key, record.installed_version });
 
-        // Recursively delete everything in the install dir
-        std.Io.Dir.cwd().deleteTree(io, record.install_dir) catch |err| {
-            std.debug.print("  (warning: could not clean {s}: {})\n", .{ record.install_dir, err });
-        };
+        if (std.mem.eql(u8, record.install_type, "custom")) {
+            // custom path — delete the entire directory
+            std.Io.Dir.cwd().deleteTree(io, record.install_dir) catch |err| {
+                std.debug.print("  (warning: could not clean {s}: {})\n", .{ record.install_dir, err });
+            };
+        }
 
         // Remove from state (fetchRemove returns KV and removes, we must free manually)
         if (state.records.fetchRemove(repo_key)) |kv| {
