@@ -489,10 +489,10 @@ fn hasProxy(environ_map: *const std.process.Environ.Map) bool {
 }
 
 fn configureHttpClient(client: *std.http.Client) void {
-    client.read_buffer_size = 64 * 1024;
-    client.write_buffer_size = 16 * 1024;
+    client.read_buffer_size = 1024 * 1024;
+    client.write_buffer_size = 64 * 1024;
     if (!std.http.Client.disable_tls) {
-        client.tls_buffer_size = 64 * 1024;
+        client.tls_buffer_size = 256 * 1024;
     }
 }
 
@@ -1092,7 +1092,6 @@ fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, pat
     const uri = try std.Uri.parse(url);
     var req = try client.request(.GET, uri, .{
         .redirect_behavior = @enumFromInt(3),
-        .keep_alive = false,
         .headers = .{
             .accept_encoding = .{ .override = "identity" },
             .user_agent = .{ .override = "snag/1.0" },
@@ -1115,11 +1114,11 @@ fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, pat
     var fb: [256 * 1024]u8 = undefined;
     var fw = file.writerStreaming(io, &fb);
 
-    var transfer_buf: [64 * 1024]u8 = undefined;
-    var decompress_buf: [64 * 1024]u8 = undefined;
+    var transfer_buf: [256 * 1024]u8 = undefined;
+    var decompress_buf: [256 * 1024]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
-    var read_buf: [256 * 1024]u8 = undefined;
+    var read_buf: [1024 * 1024]u8 = undefined;
     const total = if (response.head.content_encoding == .identity) response.head.content_length else null;
 
     const label = std.fs.path.basename(path);
