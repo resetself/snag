@@ -1654,20 +1654,36 @@ pub fn main(init: std.process.Init) !void {
     const before_files = if (!is_custom_install) try listFileNames(allocator, io, install_dir) else null;
     defer if (before_files) |bf| allocator.free(bf);
 
-    try installAsset(allocator, io, environ_map, candidate, install_dir, !is_custom_install);
-
-    // Compute installed_files (bin only; custom uses deleteTree on remove)
-    const installed_files = if (before_files) |bf| blk: {
-        const after = try listFileNames(allocator, io, install_dir);
-        defer allocator.free(after);
-        break :blk try diffNewFiles(allocator, bf, after);
-    } else try allocator.dupe(u8, "");
-
     const slug = try parseRepoSlug(args.url.?);
     const repo_key = try slugKey(slug, allocator);
     defer allocator.free(repo_key);
 
+    // Check for existing record (for merging installed_files on reinstall)
+    var old_state = try loadState(allocator, io, state_path);
+    defer old_state.deinit();
+    const old_record = findRecord(&old_state, repo_key);
+    const old_files = if (old_record) |r| r.installed_files else "";
+
+    try installAsset(allocator, io, environ_map, candidate, install_dir, !is_custom_install);
+
+    // Compute installed_files (bin only; merge old + new diff)
+    const installed_files = if (!is_custom_install and before_files != null) blk: {
+        const after = try listFileNames(allocator, io, install_dir);
+        defer allocator.free(after);
+        const new_files = try diffNewFiles(allocator, before_files.?, after);
+        // merge old_files + new_files
+        const result = if (old_files.len > 0 and new_files.len > 0)
+            try std.fmt.allocPrint(allocator, "{s},{s}", .{ old_files, new_files })
+        else if (old_files.len > 0)
+            try allocator.dupe(u8, old_files)
+        else
+            new_files;
+        if (new_files.ptr != result.ptr) allocator.free(new_files);
+        break :blk result;
+    } else try allocator.dupe(u8, "");
+
     try writeInstallRecord(allocator, io, null, state_path, repo_key, args, candidate, install_dir, if (is_custom_install) "custom" else "bin", installed_files);
+    defer allocator.free(installed_files);
     std.debug.print("Installed {s} to {s}\n", .{ candidate.release_tag, install_dir });
 }
 
