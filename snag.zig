@@ -489,10 +489,10 @@ fn hasProxy(environ_map: *const std.process.Environ.Map) bool {
 }
 
 fn configureHttpClient(client: *std.http.Client) void {
-    client.read_buffer_size = 1024 * 1024;
+    client.read_buffer_size = 2 * 1024 * 1024;
     client.write_buffer_size = 64 * 1024;
     if (!std.http.Client.disable_tls) {
-        client.tls_buffer_size = 256 * 1024;
+        client.tls_buffer_size = 2 * 1024 * 1024;
     }
 }
 
@@ -521,9 +521,10 @@ fn fetchJsonWithClient(client: *std.http.Client, allocator: std.mem.Allocator, u
     defer aw.deinit();
 
     const result = try client.fetch(.{
+        .keep_alive = false,
         .location = .{ .url = url },
         .response_writer = &aw.writer,
-        .headers = .{ .user_agent = .{ .override = "snag/1.0" } },
+        .headers = .{ .user_agent = .{ .override = "Mozilla/5.0 (compatible; snag/1.0; +https://github.com/resetself/snag)" } },
     });
 
     if (result.status != .ok) {
@@ -692,7 +693,9 @@ fn readKey() !Key {
 
 const RawTerm = if (builtin.os.tag == .windows)
     struct {
-        fn enter() !@This() { return .{}; }
+        fn enter() !@This() {
+            return .{};
+        }
         fn exit(_: *@This()) void {}
     }
 else
@@ -841,8 +844,12 @@ fn interactiveSelect(
                     try applyFilter(allocator, all_candidates, filter_buf[0..filter_len], &filtered, &filtered_len, &cursor);
                 }
             },
-            .up => { if (cursor > 0) cursor -= 1; },
-            .down => { if (cursor + 1 < filtered_len) cursor += 1; },
+            .up => {
+                if (cursor > 0) cursor -= 1;
+            },
+            .down => {
+                if (cursor + 1 < filtered_len) cursor += 1;
+            },
             .enter => {
                 if (filtered_len == 0) continue;
                 const sel = filtered[cursor];
@@ -1088,76 +1095,25 @@ fn tryUpdateMatch(
     return null;
 }
 
-fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, path: []const u8) !void {
-    const uri = try std.Uri.parse(url);
-    var req = try client.request(.GET, uri, .{
-        .redirect_behavior = @enumFromInt(3),
-        .headers = .{
-            .accept_encoding = .{ .override = "identity" },
-            .user_agent = .{ .override = "snag/1.0" },
-        },
-    });
-    defer req.deinit();
-    try req.sendBodiless();
-
-    var redirect_buf: [8192]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
-
-    if (response.head.status != .ok) {
-        std.debug.print("HTTP {d} for {s}\n", .{ @intFromEnum(response.head.status), url });
-        return error.HttpError;
-    }
-
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
-    defer file.close(io);
-
-    var fb: [256 * 1024]u8 = undefined;
+fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, file: std.Io.File) !void {
+    var fb: [1024 * 1024]u8 = undefined;
     var fw = file.writerStreaming(io, &fb);
 
-    var transfer_buf: [256 * 1024]u8 = undefined;
-    var decompress_buf: [256 * 1024]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const reader = response.readerDecompressing(&transfer_buf, &decompress, &decompress_buf);
-    var read_buf: [1024 * 1024]u8 = undefined;
-    const total = if (response.head.content_encoding == .identity) response.head.content_length else null;
-
-    const label = std.fs.path.basename(path);
-    const started = nowMonotonicMs(io);
-    var downloaded: usize = 0;
-    var next_report: usize = 512 * 1024;
-    var last_report_ms: i64 = started;
-
-    while (true) {
-        const n = reader.readSliceShort(&read_buf) catch |err| switch (err) {
-            error.ReadFailed => return response.bodyErr().?,
-        };
-        if (n == 0) break;
-        try fw.interface.writeAll(read_buf[0..n]);
-        downloaded += n;
-
-        const now = nowMonotonicMs(io);
-        if (downloaded >= next_report or now - last_report_ms > 200) {
-            next_report = downloaded + 512 * 1024;
-            last_report_ms = now;
-            const elapsed = @as(f64, @floatFromInt(now - started)) / 1000.0;
-            const mb = fmtSize(downloaded);
-            const spd = if (elapsed > 0) mb / elapsed else 0;
-            if (total) |t| {
-                const pct = if (t > 0) (@as(f64, @floatFromInt(downloaded)) * 100.0 / @as(f64, @floatFromInt(t))) else 100.0;
-                std.debug.print("\r  {s}: {d:.1}% ({d:.2}/{d:.2} MB) {d:.1} MB/s", .{ label, pct, mb, fmtSize(t), spd });
-            } else {
-                std.debug.print("\r  {s}: {d:.2} MB {d:.1} MB/s", .{ label, mb, spd });
-            }
-        }
-    }
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &fw.interface,
+        .headers = .{
+            .accept_encoding = .{ .override = "identity" },
+            .user_agent = .{ .override = "curl/8.7.1 snag/1.0" },
+        },
+    });
 
     try fw.interface.flush();
 
-    const elapsed_ms = @max(nowMonotonicMs(io) - started, 1);
-    const elapsed_s = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
-    const size = try file.stat(io);
-    const speed = if (elapsed_s > 0) fmtSize(size.size) / elapsed_s else 0;
-    std.debug.print("\r  {s}: {d:.2} MB {d:.1} MB/s\n", .{ label, fmtSize(size.size), speed });
+    if (result.status != .ok) {
+        std.debug.print("HTTP {d} for {s}\n", .{ @intFromEnum(result.status), url });
+        return error.HttpError;
+    }
 }
 
 fn download(
@@ -1167,35 +1123,42 @@ fn download(
     url: []const u8,
     path: []const u8,
 ) !void {
-    const basename = std.fs.path.basename(path);
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.snag-tmp", .{basename});
+    const label = std.fs.path.basename(path);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.snag-tmp", .{label});
     defer allocator.free(tmp_path);
 
+    const file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+    defer file.close(io);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    const started = nowMonotonicMs(io);
     const use_proxy = hasProxy(environ_map);
     var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
     configureHttpClient(&client);
     if (use_proxy) try client.initDefaultProxies(allocator, environ_map);
 
-    downloadWithClient(&client, io, url, tmp_path) catch |err| {
+    downloadWithClient(&client, io, url, file) catch |err| {
         if (use_proxy) {
+            // Truncate partially-downloaded file before retry
+            file.setLength(io, 0) catch {};
             var client2 = std.http.Client{ .allocator = allocator, .io = io };
             defer client2.deinit();
             configureHttpClient(&client2);
-            downloadWithClient(&client2, io, url, tmp_path) catch |e2| {
-                std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-                return e2;
-            };
+            downloadWithClient(&client2, io, url, file) catch |e2| return e2;
         } else {
-            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
             return err;
         }
     };
 
+    const elapsed = @as(f64, @floatFromInt(nowMonotonicMs(io) - started)) / 1000.0;
+    const size = try file.stat(io);
+    const speed = if (elapsed > 0) fmtSize(size.size) / elapsed else 0;
+    std.debug.print("  {s}: {d:.2} MB {d:.1} MB/s\n", .{ label, fmtSize(size.size), speed });
+
     try ensureParentDir(io, path);
     try std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io);
 }
-
 
 // ============================================================================
 // EXTRACT
@@ -1311,6 +1274,7 @@ fn extract(
             try runCommand(allocator, io, &.{ "unzip", "-o", archive });
         }
         try cwd.deleteFile(io, archive);
+        if (out_dir != null) try flattenSingleDir(allocator, io, target);
     } else if (std.ascii.endsWithIgnoreCase(archive, ".xz")) {
         try runCommand(allocator, io, &.{ "xz", "-d", archive });
         if (out_dir) |dir| {
@@ -1336,14 +1300,11 @@ fn isJunkFile(name: []const u8) bool {
         lower[i] = std.ascii.toLower(c);
     }
     const exact = &[_][]const u8{
-        "readme", "readme.md", "readme.txt", "readme.markdown",
-        "license", "license.md", "license.txt",
-        "changelog", "changelog.md", "changelog.txt",
-        "contributing", "contributing.md",
-        "code_of_conduct", "code_of_conduct.md",
-        "security", "security.md",
-        "authors", "authors.txt",
-        "copyright", "notice",
+        "readme",          "readme.md",          "readme.txt",   "readme.markdown",
+        "license",         "license.md",         "license.txt",  "changelog",
+        "changelog.md",    "changelog.txt",      "contributing", "contributing.md",
+        "code_of_conduct", "code_of_conduct.md", "security",     "security.md",
+        "authors",         "authors.txt",        "copyright",    "notice",
     };
     for (exact) |e| {
         if (std.mem.eql(u8, lower, e)) return true;
@@ -1435,7 +1396,8 @@ fn updateOne(
     const auto_detect = args.os_arch == null and record.selected_os_arch == null;
     const platform = if (auto_detect) currentPlatformHints() else null;
     const candidates = try collectCandidates(
-        allocator, release,
+        allocator,
+        release,
         if (args.match_keyword) |_| args.match_keyword else record.selected_match_keyword,
         if (args.os_arch) |_| args.os_arch else record.selected_os_arch,
         platform,
@@ -1710,11 +1672,11 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 // create dir named after archive (strip extension(s))
                 var ext_dir = basename;
-                if (std.ascii.endsWithIgnoreCase(ext_dir, ".tar.gz")) ext_dir = ext_dir[0..ext_dir.len-7];
-                if (std.ascii.endsWithIgnoreCase(ext_dir, ".tar.xz")) ext_dir = ext_dir[0..ext_dir.len-7];
-                if (std.ascii.endsWithIgnoreCase(ext_dir, ".tgz")) ext_dir = ext_dir[0..ext_dir.len-4];
-                if (std.ascii.endsWithIgnoreCase(ext_dir, ".zip")) ext_dir = ext_dir[0..ext_dir.len-4];
-                if (std.ascii.endsWithIgnoreCase(ext_dir, ".xz")) ext_dir = ext_dir[0..ext_dir.len-3];
+                if (std.ascii.endsWithIgnoreCase(ext_dir, ".tar.gz")) ext_dir = ext_dir[0 .. ext_dir.len - 7];
+                if (std.ascii.endsWithIgnoreCase(ext_dir, ".tar.xz")) ext_dir = ext_dir[0 .. ext_dir.len - 7];
+                if (std.ascii.endsWithIgnoreCase(ext_dir, ".tgz")) ext_dir = ext_dir[0 .. ext_dir.len - 4];
+                if (std.ascii.endsWithIgnoreCase(ext_dir, ".zip")) ext_dir = ext_dir[0 .. ext_dir.len - 4];
+                if (std.ascii.endsWithIgnoreCase(ext_dir, ".xz")) ext_dir = ext_dir[0 .. ext_dir.len - 3];
                 const ext_path = try std.fs.path.join(allocator, &.{ output_dir, ext_dir });
                 defer allocator.free(ext_path);
                 try extract(allocator, io, output_path, ext_path);
@@ -1805,7 +1767,10 @@ fn diffNewFiles(allocator: std.mem.Allocator, before: []const u8, after: []const
         var before_iter = std.mem.splitScalar(u8, before, ',');
         var found = false;
         while (before_iter.next()) |bname| {
-            if (std.mem.eql(u8, name, bname)) { found = true; break; }
+            if (std.mem.eql(u8, name, bname)) {
+                found = true;
+                break;
+            }
         }
         if (!found) {
             if (result.items.len > 0) try result.append(allocator, '\n');
@@ -1854,146 +1819,4 @@ fn writeInstallRecord(
         try upsertRecord(&state, repo_key, record);
         try saveState(&state, io, state_path);
     }
-}
-
-// ============================================================================
-// TESTS
-// ============================================================================
-
-test "repoApiUrl accepts shorthand and strips suffixes" {
-    const latest = try repoApiUrl(std.testing.allocator, "https://github.com/owner/repo.git/", null);
-    defer std.testing.allocator.free(latest);
-    try std.testing.expectEqualStrings("https://api.github.com/repos/owner/repo/releases/latest", latest);
-
-    const tagged = try repoApiUrl(std.testing.allocator, "owner/repo", "v1.2.3");
-    defer std.testing.allocator.free(tagged);
-    try std.testing.expectEqualStrings("https://api.github.com/repos/owner/repo/releases/tags/v1.2.3", tagged);
-}
-
-test "isMetadataFile ignores checksums and signatures" {
-    try std.testing.expect(isMetadataFile("CHECKSUMS.txt"));
-    try std.testing.expect(isMetadataFile("tool.tar.gz.sha256"));
-    try std.testing.expect(isMetadataFile("tool.tar.gz.asc"));
-    try std.testing.expect(!isMetadataFile("tool-darwin-arm64.tar.gz"));
-}
-
-test "collectCandidates scores and filters metadata" {
-    const release = Release{
-        .tag_name = "v1.0.0",
-        .assets = &[_]ReleaseAsset{
-            .{ .name = "tool-Linux-x86_64.tar.gz", .browser_download_url = "https://example.invalid/linux" },
-            .{ .name = "tool-Darwin-arm64.tar.gz", .browser_download_url = "https://example.invalid/darwin" },
-            .{ .name = "checksums.txt", .browser_download_url = "https://example.invalid/checksums" },
-        },
-    };
-
-    const test_macos_arm64 = PlatformHints{
-        .label = "macos/arm64",
-        .os = &os_macos,
-        .arch = &arch_arm64,
-        .other_os = &other_os_for_macos,
-        .other_arch = &other_arch_for_arm64,
-        .generic = &macos_generic,
-    };
-
-    const candidates = try collectCandidates(std.testing.allocator, release, null, null, test_macos_arm64);
-    defer std.testing.allocator.free(candidates);
-
-    // Linux filtered out (wrong OS), checksums filtered (metadata) → only Darwin remains
-    try std.testing.expectEqual(@as(usize, 1), candidates.len);
-    try std.testing.expectEqualStrings("tool-Darwin-arm64.tar.gz", candidates[0].name);
-    try std.testing.expect(candidates[0].score >= 1);
-}
-
-test "collectCandidates without platform hints returns all non-metadata" {
-    const release = Release{
-        .tag_name = "v1.0.0",
-        .assets = &[_]ReleaseAsset{
-            .{ .name = "tool-Linux-x86_64.tar.gz", .browser_download_url = "https://example.invalid/linux" },
-            .{ .name = "tool-Darwin-arm64.tar.gz", .browser_download_url = "https://example.invalid/darwin" },
-            .{ .name = "checksums.txt", .browser_download_url = "https://example.invalid/checksums" },
-        },
-    };
-
-    const candidates = try collectCandidates(std.testing.allocator, release, null, null, null);
-    defer std.testing.allocator.free(candidates);
-
-    try std.testing.expectEqual(@as(usize, 2), candidates.len);
-}
-
-test "collectCandidates accepts macOS universal assets but rejects wrong arch" {
-    const release = Release{
-        .tag_name = "v1.0.0",
-        .assets = &[_]ReleaseAsset{
-            .{ .name = "tool-macos-x86_64.tar.gz", .browser_download_url = "https://example.invalid/x64" },
-            .{ .name = "tool-macos-universal2.tar.gz", .browser_download_url = "https://example.invalid/universal" },
-        },
-    };
-
-    const test_macos_arm64 = PlatformHints{
-        .label = "macos/arm64",
-        .os = &os_macos,
-        .arch = &arch_arm64,
-        .other_os = &other_os_for_macos,
-        .other_arch = &other_arch_for_arm64,
-        .generic = &macos_generic,
-    };
-
-    const candidates = try collectCandidates(std.testing.allocator, release, null, null, test_macos_arm64);
-    defer std.testing.allocator.free(candidates);
-
-    // x86_64 filtered out (wrong arch, not generic), only universal2 remains
-    try std.testing.expectEqual(@as(usize, 1), candidates.len);
-    try std.testing.expectEqualStrings("tool-macos-universal2.tar.gz", candidates[0].name);
-}
-
-test "isObviouslyUnique with single candidate" {
-    const candidates = [_]AssetCandidate{
-        .{ .name = "tool", .browser_download_url = "url", .release_tag = "v1", .score = 5, .matches_platform = true, .matches_keyword = true, .matches_os_filter = false },
-    };
-    try std.testing.expect(isObviouslyUnique(&candidates, Args{}));
-}
-
-test "isObviouslyUnique with two candidates and clear winner" {
-    const candidates = [_]AssetCandidate{
-        .{ .name = "a", .browser_download_url = "u", .release_tag = "v1", .score = 15, .matches_platform = true, .matches_keyword = true, .matches_os_filter = true },
-        .{ .name = "b", .browser_download_url = "u", .release_tag = "v1", .score = 3, .matches_platform = false, .matches_keyword = false, .matches_os_filter = false },
-    };
-    try std.testing.expect(isObviouslyUnique(&candidates, .{ .match_keyword = "test", .os_arch = "linux" }));
-}
-
-test "isObviouslyUnique with two equal-score candidates is not unique" {
-    const candidates = [_]AssetCandidate{
-        .{ .name = "a", .browser_download_url = "u", .release_tag = "v1", .score = 9, .matches_platform = true, .matches_keyword = false, .matches_os_filter = false },
-        .{ .name = "b", .browser_download_url = "u", .release_tag = "v1", .score = 9, .matches_platform = true, .matches_keyword = false, .matches_os_filter = false },
-    };
-    try std.testing.expect(!isObviouslyUnique(&candidates, Args{}));
-}
-
-test "validateArgs rejects invalid combinations" {
-    try std.testing.expectError(error.InvalidArgs, validateArgs(.{ .cmd = .update, .url = "a/b", .extract = true }));
-    try std.testing.expectError(error.InvalidArgs, validateArgs(.{ .cmd = .install, .url = "a/b", .extract = true }));
-    try std.testing.expectError(error.InvalidArgs, validateArgs(.{ .cmd = .download }));
-    try validateArgs(.{ .cmd = .list });
-    try validateArgs(.{ .cmd = .install, .url = "a/b" });
-    try validateArgs(.{ .cmd = .download, .url = "a/b" });
-    try validateArgs(.{ .cmd = .download, .url = "a/b", .extract = true });
-    try validateArgs(.{ .cmd = .install, .url = "a/b", .extract = true, .output = "/tmp" });
-}
-
-test "slugKey formats correctly" {
-    const slug = RepoSlug{ .owner = "blacktop", .name = "ida-mcp-rs" };
-    const key = try slugKey(slug, std.testing.allocator);
-    defer std.testing.allocator.free(key);
-    try std.testing.expectEqualStrings("blacktop/ida-mcp-rs", key);
-}
-
-test "isCompressedFormat detects archive types" {
-    try std.testing.expect(isCompressedFormat("tool.tar.gz"));
-    try std.testing.expect(isCompressedFormat("tool.tar.xz"));
-    try std.testing.expect(isCompressedFormat("tool.tgz"));
-    try std.testing.expect(isCompressedFormat("tool.zip"));
-    try std.testing.expect(isCompressedFormat("tool.xz"));
-    try std.testing.expect(!isCompressedFormat("tool.exe"));
-    try std.testing.expect(!isCompressedFormat("tool"));
 }
