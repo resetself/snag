@@ -26,10 +26,6 @@ jobs:
           - label: aarch64-macos
             os: macos-latest
             binary: snag-aarch64-macos
-          - label: x86_64-windows
-            os: windows-latest
-            binary: snag-x86_64-windows.exe
-            target: x86_64-windows-gnu
 
     steps:
       - name: Checkout
@@ -39,11 +35,6 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
 
-      - name: Install libcurl (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          C:\msys64\usr\bin\pacman.exe -S --noconfirm mingw-w64-x86_64-curl
-
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
         with:
@@ -52,13 +43,8 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseFast ${{ matrix.target && format('-Dtarget={0}', matrix.target) || '' }}
 
-      - name: Rename (Unix)
-        if: runner.os != 'Windows'
+      - name: Rename
         run: mv zig-out/bin/snag ${{ matrix.binary }}
-
-      - name: Rename (Windows)
-        if: runner.os == 'Windows'
-        run: Move-Item zig-out/bin/snag.exe ${{ matrix.binary }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

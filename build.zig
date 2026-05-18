@@ -17,16 +17,6 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("curl", .{});
     root_module.linkSystemLibrary("c", .{});
 
-    if (target.result.os.tag == .windows) {
-        root_module.addIncludePath(.{ .cwd_relative = "C:/msys64/mingw64/include" });
-        root_module.addLibraryPath(.{ .cwd_relative = "C:/msys64/mingw64/lib" });
-    }
-
-    if (target.result.os.tag == .windows) {
-        root_module.addIncludePath(.{ .cwd_relative = "C:/msys64/mingw64/include" });
-        root_module.addLibraryPath(.{ .cwd_relative = "C:/msys64/mingw64/lib" });
-    }
-
     b.installArtifact(exe);
 
     const unit_tests = b.addTest(.{
