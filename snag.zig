@@ -25,8 +25,8 @@ const InstallRecord = struct {
     selected_asset_name: []const u8,
     selected_download_url: []const u8,
     install_mode: []const u8, // "archive_extract" or "raw_file"
-    install_type: []const u8, // "bin" or "custom"
-    installed_files: []const u8, // newline-separated filenames
+    install_type: []const u8, // "lean" or "full"
+    installed_files: []const []const u8,
     selected_match_keyword: ?[]const u8,
     selected_os_arch: ?[]const u8,
     installed_at: []const u8,
@@ -48,6 +48,7 @@ const StateFile = struct {
             self.allocator.free(entry.value_ptr.selected_download_url);
             self.allocator.free(entry.value_ptr.install_mode);
             self.allocator.free(entry.value_ptr.install_type);
+            for (entry.value_ptr.installed_files) |f| self.allocator.free(f);
             self.allocator.free(entry.value_ptr.installed_files);
             if (entry.value_ptr.selected_match_keyword) |kw| self.allocator.free(kw);
             if (entry.value_ptr.selected_os_arch) |os| self.allocator.free(os);
@@ -304,7 +305,8 @@ fn usage() void {
         \\
         \\Usage:
         \\  snag install  <repo>               Install to ~/.local/snag/bin/
-        \\  snag install  <repo> -x <path>     Extract to path, track in state
+        \\  snag install  <repo> <dir>           Install to <dir> (binaries only)
+        \\  snag install  <repo> -x [path]       Extract to path (keep all files)
         \\  snag download <repo> [path]        Download asset (or to path)
         \\  snag download <repo> -x [path]     Download + extract (or to path)
         \\  snag update   <repo>               Update installed repo
@@ -331,7 +333,7 @@ fn usage() void {
 }
 
 fn looksLikeRepo(arg: []const u8) bool {
-    return std.mem.indexOfScalar(u8, arg, '/') != null or
+    return std.mem.findScalar(u8, arg, '/') != null or
         std.ascii.indexOfIgnoreCase(arg, "github.com") != null;
 }
 
@@ -409,10 +411,6 @@ fn validateArgs(args: Args) !void {
         return;
     }
     if (args.cmd == .remove) return;
-    if (args.cmd == .install and args.extract and args.output == null) {
-        std.debug.print("error: install -x requires a path (e.g. snag install <repo> -x ./out)\n", .{});
-        return error.InvalidArgs;
-    }
 }
 
 // ============================================================================
@@ -468,6 +466,10 @@ fn parseRepoSlug(repo: []const u8) !RepoSlug {
 
 fn slugKey(slug: RepoSlug, allocator: std.mem.Allocator) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ slug.owner, slug.name });
+}
+
+fn assetKey(slug: RepoSlug, asset_name: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ slug.owner, slug.name, asset_name });
 }
 
 fn repoApiUrl(allocator: std.mem.Allocator, repo: []const u8, version: ?[]const u8) ![]const u8 {
@@ -919,12 +921,43 @@ fn parseInstallRecord(allocator: std.mem.Allocator, value: std.json.Value) !Inst
         .selected_asset_name = try allocator.dupe(u8, getStringField(obj, "selected_asset_name") orelse return error.InvalidStateFormat),
         .selected_download_url = try allocator.dupe(u8, getStringField(obj, "selected_download_url") orelse return error.InvalidStateFormat),
         .install_mode = try allocator.dupe(u8, getStringField(obj, "install_mode") orelse return error.InvalidStateFormat),
-        .install_type = try allocator.dupe(u8, getStringField(obj, "install_type") orelse "bin"),
-        .installed_files = try allocator.dupe(u8, getStringField(obj, "installed_files") orelse ""),
+        .install_type = try allocator.dupe(u8, installTypeCompat(getStringField(obj, "install_type"))),
+        .installed_files = try parseInstalledFiles(allocator, obj),
         .selected_match_keyword = if (getStringField(obj, "selected_match_keyword")) |kw| try allocator.dupe(u8, kw) else null,
         .selected_os_arch = if (getStringField(obj, "selected_os_arch")) |osa| try allocator.dupe(u8, osa) else null,
         .installed_at = try allocator.dupe(u8, getStringField(obj, "installed_at") orelse return error.InvalidStateFormat),
     };
+}
+
+fn installTypeCompat(raw: ?[]const u8) []const u8 {
+    const val = raw orelse return "lean";
+    if (std.mem.eql(u8, val, "bin")) return "lean";
+    if (std.mem.eql(u8, val, "custom")) return "full";
+    return val;
+}
+
+fn parseInstalledFiles(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]const []const u8 {
+    const val = obj.get("installed_files") orelse return &.{};
+    if (val == .array) {
+        const arr = val.array;
+        const files = try allocator.alloc([]const u8, arr.items.len);
+        for (arr.items, 0..) |item, i| {
+            files[i] = try allocator.dupe(u8, item.string);
+        }
+        return files;
+    }
+    if (val == .string) {
+        const s = val.string;
+        if (s.len == 0) return &.{};
+        var list: std.ArrayList([]const u8) = .empty;
+        var iter = std.mem.splitAny(u8, s, ",\n");
+        while (iter.next()) |name| {
+            if (name.len == 0) continue;
+            try list.append(allocator, try allocator.dupe(u8, name));
+        }
+        return list.toOwnedSlice(allocator);
+    }
+    return &.{};
 }
 
 fn getStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -942,6 +975,7 @@ fn freeRecordFields(allocator: std.mem.Allocator, rec: *InstallRecord) void {
     allocator.free(rec.selected_download_url);
     allocator.free(rec.install_mode);
     allocator.free(rec.install_type);
+    for (rec.installed_files) |f| allocator.free(f);
     allocator.free(rec.installed_files);
     if (rec.selected_match_keyword) |kw| allocator.free(kw);
     if (rec.selected_os_arch) |os| allocator.free(os);
@@ -971,7 +1005,7 @@ fn saveState(state: *const StateFile, io: std.Io, state_path: []const u8) !void 
             \\    "selected_download_url": "{s}",
             \\    "install_mode": "{s}",
             \\    "install_type": "{s}",
-            \\    "installed_files": "{s}"
+            \\    "installed_files": [
         , .{
             entry.key_ptr.*,
             rec.repo_url,
@@ -982,8 +1016,12 @@ fn saveState(state: *const StateFile, io: std.Io, state_path: []const u8) !void 
             rec.selected_download_url,
             rec.install_mode,
             rec.install_type,
-            rec.installed_files,
         });
+        for (rec.installed_files, 0..) |f, i| {
+            if (i > 0) try buf.appendSlice(gpa, ", ");
+            try buf.print(gpa, "\"{s}\"", .{f});
+        }
+        try buf.appendSlice(gpa, "]");
 
         if (rec.selected_match_keyword) |kw| {
             try buf.print(gpa, ",\n    \"selected_match_keyword\": \"{s}\"", .{kw});
@@ -1019,6 +1057,27 @@ fn upsertRecord(state: *StateFile, key: []const u8, record: InstallRecord) !void
 
 fn findRecord(state: *const StateFile, key: []const u8) ?InstallRecord {
     return state.records.get(key);
+}
+
+fn findRepoRecords(state: *const StateFile, repo_slug: []const u8) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = state.records.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.value_ptr.repo_slug, repo_slug)) {
+            try list.append(state.allocator, entry.key_ptr.*);
+        }
+    }
+    return list.toOwnedSlice(state.allocator);
+}
+
+fn migrateRecordKey(allocator: std.mem.Allocator, state: *StateFile, old_key: []const u8, repo_slug: []const u8) !void {
+    if (state.records.fetchRemove(old_key)) |kv| {
+        const rec = kv.value;
+        const new_key = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ repo_slug, rec.selected_asset_name });
+        errdefer allocator.free(new_key);
+        try state.records.put(new_key, rec);
+        allocator.free(kv.key);
+    }
 }
 
 fn findByShortName(state: *const StateFile, short: []const u8) ![]const u8 {
@@ -1100,6 +1159,7 @@ fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, fil
     var fw = file.writerStreaming(io, &fb);
 
     const result = try client.fetch(.{
+        .keep_alive = false,
         .location = .{ .url = url },
         .response_writer = &fw.interface,
         .headers = .{
@@ -1184,8 +1244,8 @@ fn runCommand(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8
 }
 
 fn basenameFromUrl(url: []const u8) []const u8 {
-    const query_pos = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
-    const fragment_pos = std.mem.indexOfScalar(u8, url, '#') orelse url.len;
+    const query_pos = std.mem.findScalar(u8, url, '?') orelse url.len;
+    const fragment_pos = std.mem.findScalar(u8, url, '#') orelse url.len;
     const end = @min(query_pos, fragment_pos);
     return std.fs.path.basename(url[0..end]);
 }
@@ -1412,9 +1472,9 @@ fn updateOne(
             std.debug.print("  (already up to date)\n", .{});
             return;
         }
-        const do_clean = std.mem.eql(u8, record.install_type, "bin");
+        const do_clean = std.mem.eql(u8, record.install_type, "lean");
         try installAsset(allocator, io, environ_map, c, record.install_dir, do_clean);
-        try writeInstallRecord(allocator, io, state, state_path, repo_key, args, c, record.install_dir, record.install_type, "");
+        try writeInstallRecord(allocator, io, state, state_path, repo_key, args, c, record.install_dir, record.install_type, &.{});
         return;
     }
 
@@ -1422,9 +1482,9 @@ fn updateOne(
         std.debug.print("  Auto-match failed, entering interactive mode...\n", .{});
         const idx = try interactiveSelect(allocator, candidates) orelse return;
         const c = candidates[idx];
-        const do_clean = std.mem.eql(u8, record.install_type, "bin");
+        const do_clean = std.mem.eql(u8, record.install_type, "lean");
         try installAsset(allocator, io, environ_map, c, record.install_dir, do_clean);
-        try writeInstallRecord(allocator, io, state, state_path, repo_key, args, c, record.install_dir, record.install_type, "");
+        try writeInstallRecord(allocator, io, state, state_path, repo_key, args, c, record.install_dir, record.install_type, &.{});
         return;
     }
 
@@ -1491,14 +1551,31 @@ fn resolveRepoKey(
     state: *const StateFile,
     url: []const u8,
 ) ![]const u8 {
-    // First try as owner/repo or full URL
-    if (parseRepoSlug(url)) |slug| {
-        const key = try slugKey(slug, allocator);
+    // Handle @asset syntax: owner/name@asset
+    if (std.mem.findScalar(u8, url, '@')) |at_pos| {
+        const repo_part = url[0..at_pos];
+        const slug = try parseRepoSlug(repo_part);
+        const key = try assetKey(slug, url[at_pos + 1 ..], allocator);
         if (state.records.get(key) != null) return key;
         allocator.free(key);
         return error.NoInstallRecord;
+    }
+    // Try as owner/repo or full URL
+    if (parseRepoSlug(url)) |slug| {
+        // Check for single-asset key first
+        const simple_key = try slugKey(slug, allocator);
+        if (state.records.get(simple_key) != null) return simple_key;
+        allocator.free(simple_key);
+        // Check for multi-asset keys
+        const keys = try findRepoRecords(state, try slugKey(slug, allocator));
+        if (keys.len > 0) {
+            std.debug.print("error: '{s}' has multiple assets. Use '@' to specify:\n", .{url});
+            for (keys) |k| std.debug.print("  {s}\n", .{k});
+            return error.AmbiguousMatch;
+        }
+        return error.NoInstallRecord;
     } else |_| {}
-    // Short name lookup returns map-owned pointer; dup for caller
+    // Short name lookup
     const short = try findByShortName(state, url);
     return try allocator.dupe(u8, short);
 }
@@ -1576,18 +1653,21 @@ pub fn main(init: std.process.Init) !void {
         const record = findRecord(&state, repo_key).?;
         std.debug.print("Removing {s} ({s})...\n", .{ repo_key, record.installed_version });
 
-        if (std.mem.eql(u8, record.install_type, "custom")) {
+        if (record.installed_files.len == 0) {
+            // custom directory — owns the whole dir
             std.Io.Dir.cwd().deleteTree(io, record.install_dir) catch |err| {
                 std.debug.print("  (warning: could not clean {s}: {})\n", .{ record.install_dir, err });
             };
-        } else if (record.installed_files.len > 0) {
-            // bin install — delete only recorded files
-            var file_iter = std.mem.splitScalar(u8, record.installed_files, ',');
-            while (file_iter.next()) |name| {
-                if (name.len == 0) continue;
+        } else {
+            for (record.installed_files) |name| {
                 const fp = try std.fs.path.join(allocator, &.{ record.install_dir, name });
                 defer allocator.free(fp);
-                std.Io.Dir.cwd().deleteFile(io, fp) catch {};
+                if (std.Io.Dir.cwd().openDir(io, fp, .{})) |d| {
+                    d.close(io);
+                    std.Io.Dir.cwd().deleteTree(io, fp) catch {};
+                } else |_| {
+                    std.Io.Dir.cwd().deleteFile(io, fp) catch {};
+                }
             }
         }
 
@@ -1636,17 +1716,34 @@ pub fn main(init: std.process.Init) !void {
         var state = try loadState(allocator, io, state_path);
         defer state.deinit();
 
-        const repo_key_raw = resolveRepoKey(allocator, &state, args.url.?) catch |err| {
-            if (err == error.NoInstallRecord) {
+        const single_key = resolveRepoKey(allocator, &state, args.url.?) catch |err| switch (err) {
+            error.NoInstallRecord => {
                 std.debug.print("error: '{s}' is not installed. Run `snag install {s}` first.\n", .{ args.url.?, args.url.? });
                 return err;
-            }
-            return err;
+            },
+            error.AmbiguousMatch => null,
+            else => |e| return e,
         };
-        const repo_key = try allocator.dupe(u8, repo_key_raw);
-        defer allocator.free(repo_key);
 
-        try updateOne(allocator, io, environ_map, &state, state_path, repo_key, args);
+        if (single_key) |key| {
+            const repo_key = try allocator.dupe(u8, key);
+            defer allocator.free(repo_key);
+            try updateOne(allocator, io, environ_map, &state, state_path, repo_key, args);
+        } else {
+            // Multiple assets: update all for this repo
+            const slug = try parseRepoSlug(args.url.?);
+            const repo_slug_str = try slugKey(slug, allocator);
+            defer allocator.free(repo_slug_str);
+            const keys = try findRepoRecords(&state, repo_slug_str);
+            defer allocator.free(keys);
+            for (keys) |k| {
+                std.debug.print("\n--- {s} ---\n", .{k});
+                updateOne(allocator, io, environ_map, &state, state_path, k, args) catch |err| {
+                    std.debug.print("  failed: {}\n", .{err});
+                };
+            }
+            try saveState(&state, io, state_path);
+        }
         return;
     }
 
@@ -1690,53 +1787,90 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ---- INSTALL ----
-    const install_dir = if (args.extract)
-        try allocator.dupe(u8, args.output.?) // install -x <path>
-    else
+    const cwd_path = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_path);
+
+    const install_dir = if (args.output) |out|
+        if (std.fs.path.isAbsolute(out))
+            try allocator.dupe(u8, out)
+        else
+            try std.fs.path.join(allocator, &.{ cwd_path, out })
+    else if (args.extract) blk: {
+        // -x without path: create subdir named after asset (strip archive ext)
+        var dir_name = candidate.name;
+        inline for (.{ ".tar.gz", ".tar.xz", ".tgz", ".zip", ".xz" }) |ext| {
+            if (std.ascii.endsWithIgnoreCase(dir_name, ext)) {
+                dir_name = dir_name[0 .. dir_name.len - ext.len];
+                break;
+            }
+        }
+        break :blk try std.fs.path.join(allocator, &.{ cwd_path, dir_name });
+    } else
         try getInstallDir(allocator, home_dir);
     defer allocator.free(install_dir);
 
-    const is_custom_install = args.extract;
-    // Snapshot files before install (bin type only, for diff)
-    const before_files = if (!is_custom_install) try listFileNames(allocator, io, install_dir) else null;
+    const is_full_install = args.extract;
+    const is_custom_dir = args.output != null;
+    // Snapshot before install only for lean + default bin (track individual files)
+    const before_files = if (!is_full_install and !is_custom_dir) try listEntries(allocator, io, install_dir) else null;
     defer if (before_files) |bf| allocator.free(bf);
 
     const slug = try parseRepoSlug(args.url.?);
-    const repo_key = try slugKey(slug, allocator);
-    defer allocator.free(repo_key);
+    const repo_slug_str = try slugKey(slug, allocator);
+    defer allocator.free(repo_slug_str);
 
-    // Check for existing record (for merging installed_files on reinstall)
+    // Check existing records for this repo
     var old_state = try loadState(allocator, io, state_path);
     defer old_state.deinit();
+
+    // Determine key: use @ only when repo already has records
+    const existing = try findRepoRecords(&old_state, repo_slug_str);
+    defer allocator.free(existing);
+    const repo_key = if (existing.len == 0)
+        try allocator.dupe(u8, repo_slug_str)
+    else blk: {
+        // Multiple assets: migrate single key to @ format if needed
+        if (existing.len == 1 and std.mem.findScalar(u8, existing[0], '@') == null) {
+            try migrateRecordKey(allocator, &old_state, existing[0], repo_slug_str);
+        }
+        break :blk try assetKey(slug, candidate.name, allocator);
+    };
+    defer allocator.free(repo_key);
+
     const old_record = findRecord(&old_state, repo_key);
-    const old_files = if (old_record) |r| r.installed_files else "";
 
-    try installAsset(allocator, io, environ_map, candidate, install_dir, !is_custom_install);
+    try installAsset(allocator, io, environ_map, candidate, install_dir, !is_full_install);
 
-    // Compute installed_files (bin only; merge old + new diff)
-    const installed_files = if (!is_custom_install and before_files != null) blk: {
-        const after = try listFileNames(allocator, io, install_dir);
-        defer allocator.free(after);
-        const new_files = try diffNewFiles(allocator, before_files.?, after);
-        // merge old_files + new_files
-        const result = if (old_files.len > 0 and new_files.len > 0)
-            try std.fmt.allocPrint(allocator, "{s},{s}", .{ old_files, new_files })
-        else if (old_files.len > 0)
-            try allocator.dupe(u8, old_files)
-        else
-            new_files;
-        if (new_files.ptr != result.ptr) allocator.free(new_files);
-        break :blk result;
-    } else try allocator.dupe(u8, "");
+    const is_archive = isCompressedFormat(basenameFromUrl(candidate.browser_download_url));
 
-    try writeInstallRecord(allocator, io, null, state_path, repo_key, args, candidate, install_dir, if (is_custom_install) "custom" else "bin", installed_files);
-    defer allocator.free(installed_files);
+    // Compute installed_files:
+    // - full (extract all): empty, remove deletes whole dir
+    // - lean + custom dir + raw file: just the filename
+    // - lean + default bin: diff-based tracking
+    const installed_files = if (is_full_install)
+        &.{}
+    else if (is_custom_dir and !is_archive) blk: {
+        const name = basenameFromUrl(candidate.browser_download_url);
+        const files = try allocator.alloc([]const u8, 1);
+        files[0] = try allocator.dupe(u8, name);
+        break :blk files;
+    } else if (!is_custom_dir) blk: {
+        const after = try listEntries(allocator, io, install_dir);
+        defer freeEntries(allocator, after);
+        const new_entries = try diffEntries(allocator, before_files.?, after);
+        if (old_record) |r| {
+            break :blk try mergeEntries(allocator, r.installed_files, new_entries);
+        }
+        break :blk new_entries;
+    } else &.{};
+
+    try writeInstallRecord(allocator, io, null, state_path, repo_key, args, candidate, install_dir, if (is_full_install) "full" else "lean", installed_files);
     std.debug.print("Installed {s} to {s}\n", .{ candidate.release_tag, install_dir });
 }
 
-fn listFileNames(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![]const u8 {
+fn listEntries(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![]const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;
-    defer {
+    errdefer {
         for (names.items) |n| allocator.free(n);
         names.deinit(allocator);
     }
@@ -1745,39 +1879,42 @@ fn listFileNames(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8)
         defer dir.close(io);
         var iter = dir.iterate();
         while (try iter.next(io)) |entry| {
-            if (entry.kind != .file) continue;
+            if (entry.kind != .file and entry.kind != .directory) continue;
             try names.append(allocator, try allocator.dupe(u8, entry.name));
         }
     } else |_| {}
 
-    var result: std.ArrayList(u8) = .empty;
-    defer result.deinit(allocator);
-    for (names.items, 0..) |name, i| {
-        if (i > 0) try result.append(allocator, ',');
-        try result.appendSlice(allocator, name);
-    }
-    return try result.toOwnedSlice(allocator);
+    return names.toOwnedSlice(allocator);
 }
 
-fn diffNewFiles(allocator: std.mem.Allocator, before: []const u8, after: []const u8) ![]const u8 {
-    var result: std.ArrayList(u8) = .empty;
-    var after_iter = std.mem.splitScalar(u8, after, ',');
-    while (after_iter.next()) |name| {
-        if (name.len == 0) continue;
-        var before_iter = std.mem.splitScalar(u8, before, ',');
-        var found = false;
-        while (before_iter.next()) |bname| {
-            if (std.mem.eql(u8, name, bname)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            if (result.items.len > 0) try result.append(allocator, '\n');
-            try result.appendSlice(allocator, name);
-        }
+fn freeEntries(allocator: std.mem.Allocator, entries: []const []const u8) void {
+    for (entries) |e| allocator.free(e);
+    allocator.free(entries);
+}
+
+fn diffEntries(allocator: std.mem.Allocator, before: []const []const u8, after: []const []const u8) ![]const []const u8 {
+    var new_entries: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (new_entries.items) |e| allocator.free(e);
+        new_entries.deinit(allocator);
     }
-    return try result.toOwnedSlice(allocator);
+    for (after) |name| {
+        var found = false;
+        for (before) |bname| {
+            if (std.mem.eql(u8, name, bname)) { found = true; break; }
+        }
+        if (!found) try new_entries.append(allocator, try allocator.dupe(u8, name));
+    }
+    return new_entries.toOwnedSlice(allocator);
+}
+
+fn mergeEntries(allocator: std.mem.Allocator, old: []const []const u8, new: []const []const u8) ![]const []const u8 {
+    const total = old.len + new.len;
+    const merged = try allocator.alloc([]const u8, total);
+    for (old, 0..) |e, i| merged[i] = try allocator.dupe(u8, e);
+    for (new, 0..) |e, i| merged[old.len + i] = e;
+    allocator.free(new);
+    return merged;
 }
 
 fn writeInstallRecord(
@@ -1790,7 +1927,7 @@ fn writeInstallRecord(
     candidate: AssetCandidate,
     install_dir: []const u8,
     install_type: []const u8,
-    installed_files: []const u8,
+    installed_files: []const []const u8,
 ) !void {
     const now_str = try nowUtcString(allocator, io);
     defer allocator.free(now_str);
@@ -1804,7 +1941,11 @@ fn writeInstallRecord(
         .selected_download_url = try allocator.dupe(u8, candidate.browser_download_url),
         .install_mode = try allocator.dupe(u8, if (isCompressedFormat(candidate.name)) "archive_extract" else "raw_file"),
         .install_type = try allocator.dupe(u8, install_type),
-        .installed_files = try allocator.dupe(u8, installed_files),
+        .installed_files = blk: {
+            const files = try allocator.alloc([]const u8, installed_files.len);
+            for (installed_files, 0..) |f, i| files[i] = try allocator.dupe(u8, f);
+            break :blk files;
+        },
         .selected_match_keyword = if (args.match_keyword) |kw| try allocator.dupe(u8, kw) else null,
         .selected_os_arch = if (args.os_arch) |osa| try allocator.dupe(u8, osa) else null,
         .installed_at = try allocator.dupe(u8, now_str),
