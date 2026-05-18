@@ -17,7 +17,7 @@ jobs:
             os: ubuntu-latest
             binary: snag-x86_64-linux
           - target: aarch64-linux
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             binary: snag-aarch64-linux
           - target: x86_64-macos
             os: macos-latest
@@ -33,16 +33,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install libcurl (Linux x86_64)
-        if: matrix.target == 'x86_64-linux'
+      - name: Install libcurl (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
-
-      - name: Install libcurl (Linux aarch64 cross-compile)
-        if: matrix.target == 'aarch64-linux'
-        run: |
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev:arm64
 
       - name: Install libcurl (Windows)
         if: runner.os == 'Windows'
