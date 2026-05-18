@@ -1660,7 +1660,7 @@ fn doInstall(
             new_entries;
     } else &.{};
 
-    try writeInstallRecord(allocator, io, null, state_path, repo_key, args, candidate, install_dir, if (full) "full" else "lean", installed_files);
+    try writeInstallRecord(allocator, io, &old, state_path, repo_key, args, candidate, install_dir, if (full) "full" else "lean", installed_files);
     std.debug.print("Installed {s} to {s}\n", .{ candidate.release_tag, install_dir });
 }
 
@@ -1940,7 +1940,7 @@ fn writeInstallRecord(
 
     const record = InstallRecord{
         .repo_url = try allocator.dupe(u8, args.url.?),
-        .repo_slug = try allocator.dupe(u8, repo_key),
+        .repo_slug = try allocator.dupe(u8, if (std.mem.findScalar(u8, repo_key, '@')) |at| repo_key[0..at] else repo_key),
         .install_dir = try allocator.dupe(u8, install_dir),
         .installed_version = try allocator.dupe(u8, candidate.release_tag),
         .selected_asset_name = try allocator.dupe(u8, candidate.name),
