@@ -1058,6 +1058,23 @@ fn findRecord(state: *const StateFile, key: []const u8) ?InstallRecord {
     return state.records.get(key);
 }
 
+fn removeRecordFiles(allocator: std.mem.Allocator, io: std.Io, rec: *const InstallRecord) void {
+    if (rec.installed_files.len == 0) {
+        std.Io.Dir.cwd().deleteTree(io, rec.install_dir) catch {};
+    } else {
+        for (rec.installed_files) |name| {
+            const fp = std.fs.path.join(allocator, &.{ rec.install_dir, name }) catch continue;
+            defer allocator.free(fp);
+            if (std.Io.Dir.cwd().openDir(io, fp, .{})) |d| {
+                d.close(io);
+                std.Io.Dir.cwd().deleteTree(io, fp) catch {};
+            } else |_| {
+                std.Io.Dir.cwd().deleteFile(io, fp) catch {};
+            }
+        }
+    }
+}
+
 fn findRepoRecords(state: *const StateFile, repo_slug: []const u8) ![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     var it = state.records.iterator();
@@ -1640,11 +1657,15 @@ fn doInstall(
     else if (existing.len == 1 and std.mem.findScalar(u8, existing[0], '@') == null) blk: {
         const rec = findRecord(&old, existing[0]).?;
         if (std.mem.eql(u8, rec.selected_asset_name, candidate.name)) {
-            // Same asset: skip if same version
-            if (std.mem.eql(u8, rec.installed_version, candidate.release_tag)) {
+            // Same asset + same version + same path: skip
+            if (std.mem.eql(u8, rec.installed_version, candidate.release_tag) and
+                std.mem.eql(u8, rec.install_dir, install_dir))
+            {
                 std.debug.print("{s} {s} is already installed\n", .{ base_key, candidate.release_tag });
                 return;
             }
+            // Clean up old install before reinstalling
+            removeRecordFiles(allocator, io, &rec);
             break :blk try allocator.dupe(u8, existing[0]);
         }
         try migrateRecordKey(allocator, &old, existing[0], base_key);
@@ -1750,23 +1771,7 @@ fn mainInner(init: std.process.Init) !void {
         const record = findRecord(&state, repo_key).?;
         std.debug.print("Removing {s} ({s})...\n", .{ repo_key, record.installed_version });
 
-        if (record.installed_files.len == 0) {
-            // custom directory — owns the whole dir
-            std.Io.Dir.cwd().deleteTree(io, record.install_dir) catch |err| {
-                std.debug.print("  (warning: could not clean {s}: {})\n", .{ record.install_dir, err });
-            };
-        } else {
-            for (record.installed_files) |name| {
-                const fp = try std.fs.path.join(allocator, &.{ record.install_dir, name });
-                defer allocator.free(fp);
-                if (std.Io.Dir.cwd().openDir(io, fp, .{})) |d| {
-                    d.close(io);
-                    std.Io.Dir.cwd().deleteTree(io, fp) catch {};
-                } else |_| {
-                    std.Io.Dir.cwd().deleteFile(io, fp) catch {};
-                }
-            }
-        }
+        removeRecordFiles(allocator, io, &record);
 
         // Remove from state (fetchRemove returns KV and removes, we must free manually)
         if (state.records.fetchRemove(repo_key)) |kv| {
