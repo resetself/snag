@@ -8,26 +8,28 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - target: x86_64-linux
+          - label: x86_64-linux
             os: ubuntu-latest
             binary: snag-x86_64-linux
-          - target: aarch64-linux
+          - label: aarch64-linux
             os: ubuntu-24.04-arm
             binary: snag-aarch64-linux
-          - target: x86_64-macos
-            os: macos-latest
+          - label: x86_64-macos
+            os: macos-13
             binary: snag-x86_64-macos
-          - target: aarch64-macos
+            target: x86_64-macos
+          - label: aarch64-macos
             os: macos-latest
             binary: snag-aarch64-macos
-          - target: x86_64-windows-gnu
+          - label: x86_64-windows
             os: windows-latest
             binary: snag-x86_64-windows.exe
+            target: x86_64-windows-gnu
 
     steps:
       - name: Checkout
@@ -35,7 +37,7 @@ jobs:
 
       - name: Install libcurl (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
 
       - name: Install libcurl (Windows)
         if: runner.os == 'Windows'
@@ -48,7 +50,7 @@ jobs:
           version: 0.16.0
 
       - name: Build
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast ${{ matrix.target && format('-Dtarget={0}', matrix.target) || '' }}
 
       - name: Rename (Unix)
         if: runner.os != 'Windows'
