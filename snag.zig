@@ -1062,7 +1062,9 @@ fn findRepoRecords(state: *const StateFile, repo_slug: []const u8) ![]const []co
     var list: std.ArrayList([]const u8) = .empty;
     var it = state.records.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.value_ptr.repo_slug, repo_slug)) {
+        const stored = entry.value_ptr.repo_slug;
+        const base = if (std.mem.findScalar(u8, stored, '@')) |at| stored[0..at] else stored;
+        if (std.mem.eql(u8, base, repo_slug)) {
             try list.append(state.allocator, entry.key_ptr.*);
         }
     }
@@ -1631,13 +1633,24 @@ fn doInstall(
 
     const existing = try findRepoRecords(&old, base_key);
     defer allocator.free(existing);
+
+    // Determine key: only use @ when repo has multiple *different* assets
     const repo_key = if (existing.len == 0)
         try allocator.dupe(u8, base_key)
-    else blk: {
-        if (existing.len == 1 and std.mem.findScalar(u8, existing[0], '@') == null)
-            try migrateRecordKey(allocator, &old, existing[0], base_key);
+    else if (existing.len == 1 and std.mem.findScalar(u8, existing[0], '@') == null) blk: {
+        const rec = findRecord(&old, existing[0]).?;
+        if (std.mem.eql(u8, rec.selected_asset_name, candidate.name)) {
+            // Same asset: skip if same version
+            if (std.mem.eql(u8, rec.installed_version, candidate.release_tag)) {
+                std.debug.print("{s} {s} is already installed\n", .{ base_key, candidate.release_tag });
+                return;
+            }
+            break :blk try allocator.dupe(u8, existing[0]);
+        }
+        try migrateRecordKey(allocator, &old, existing[0], base_key);
         break :blk try assetKey(slug, candidate.name, allocator);
-    };
+    } else
+        try assetKey(slug, candidate.name, allocator);
     defer allocator.free(repo_key);
 
     try installAsset(allocator, io, environ_map, candidate, install_dir, !full);
