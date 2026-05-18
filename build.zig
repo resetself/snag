@@ -14,6 +14,8 @@ pub fn build(b: *std.Build) void {
         .name = "snag",
         .root_module = root_module,
     });
+    root_module.linkSystemLibrary("curl", .{});
+    root_module.linkSystemLibrary("c", .{});
 
     b.installArtifact(exe);
 
