@@ -20,7 +20,7 @@ jobs:
             os: ubuntu-24.04-arm
             binary: snag-aarch64-linux
           - label: x86_64-macos
-            os: macos-13
+            os: macos-latest
             binary: snag-x86_64-macos
             target: x86_64-macos
           - label: aarch64-macos
