@@ -522,15 +522,18 @@ fn fetchJsonWithClient(client: *std.http.Client, allocator: std.mem.Allocator, u
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &list);
     defer aw.deinit();
 
-    const result = try client.fetch(.{
+    const result = client.fetch(.{
         .keep_alive = false,
         .location = .{ .url = url },
         .response_writer = &aw.writer,
         .headers = .{ .user_agent = .{ .override = "Mozilla/5.0 (compatible; snag/1.0; +https://github.com/resetself/snag)" } },
-    });
+    }) catch |err| {
+        std.debug.print("error: failed to fetch {s}: {}\n", .{ url, err });
+        return err;
+    };
 
     if (result.status != .ok) {
-        std.debug.print("HTTP {d} for {s}\n", .{ @intFromEnum(result.status), url });
+        std.debug.print("error: HTTP {d} for {s}\n", .{ @intFromEnum(result.status), url });
         return error.HttpError;
     }
     return aw.toOwnedSlice();
@@ -1158,7 +1161,7 @@ fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, fil
     var fb: [1024 * 1024]u8 = undefined;
     var fw = file.writerStreaming(io, &fb);
 
-    const result = try client.fetch(.{
+    const result = client.fetch(.{
         .keep_alive = false,
         .location = .{ .url = url },
         .response_writer = &fw.interface,
@@ -1166,12 +1169,15 @@ fn downloadWithClient(client: *std.http.Client, io: std.Io, url: []const u8, fil
             .accept_encoding = .{ .override = "identity" },
             .user_agent = .{ .override = "curl/8.7.1 snag/1.0" },
         },
-    });
+    }) catch |err| {
+        std.debug.print("error: download failed: {}\n", .{err});
+        return err;
+    };
 
     try fw.interface.flush();
 
     if (result.status != .ok) {
-        std.debug.print("HTTP {d} for {s}\n", .{ @intFromEnum(result.status), url });
+        std.debug.print("error: HTTP {d} for {s}\n", .{ @intFromEnum(result.status), url });
         return error.HttpError;
     }
 }
@@ -1580,7 +1586,14 @@ fn resolveRepoKey(
     return try allocator.dupe(u8, short);
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
+    mainInner(init) catch |err| {
+        std.debug.print("error: {}\n", .{err});
+        std.process.cleanExit(init.io);
+    };
+}
+
+fn mainInner(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
     const environ_map = init.environ_map;
