@@ -17,6 +17,13 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("curl", .{});
     root_module.linkSystemLibrary("c", .{});
 
+    // macOS 交叉编译需显式指定 SDK 路径
+    if (target.result.os.tag == .macos) {
+        const sdk = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr";
+        root_module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{sdk}) });
+        root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{sdk}) });
+    }
+
     b.installArtifact(exe);
 
     const unit_tests = b.addTest(.{
