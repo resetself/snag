@@ -511,8 +511,12 @@ fn fetchJson(allocator: std.mem.Allocator, io: std.Io, environ_map: *const std.p
             var client2 = std.http.Client{ .allocator = allocator, .io = io };
             defer client2.deinit();
             configureHttpClient(&client2);
-            return fetchJsonWithClient(&client2, allocator, url);
+            return fetchJsonWithClient(&client2, allocator, url) catch |e2| {
+                std.debug.print("error: API request failed: {}\n", .{e2});
+                return e2;
+            };
         }
+        std.debug.print("error: API request failed: {}\n", .{err});
         return err;
     };
 }
@@ -522,15 +526,11 @@ fn fetchJsonWithClient(client: *std.http.Client, allocator: std.mem.Allocator, u
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &list);
     defer aw.deinit();
 
-    const result = client.fetch(.{
-        .keep_alive = false,
+    const result = try client.fetch(.{
         .location = .{ .url = url },
         .response_writer = &aw.writer,
         .headers = .{ .user_agent = .{ .override = "Mozilla/5.0 (compatible; snag/1.0; +https://github.com/resetself/snag)" } },
-    }) catch |err| {
-        std.debug.print("error: failed to fetch {s}: {}\n", .{ url, err });
-        return err;
-    };
+    });
 
     if (result.status != .ok) {
         std.debug.print("error: HTTP {d} for {s}\n", .{ @intFromEnum(result.status), url });
@@ -1158,18 +1158,14 @@ fn fetchToFile(client: *std.http.Client, io: std.Io, url: []const u8, file: std.
     var fw = file.writerStreaming(io, &fb);
     defer fw.interface.flush() catch {};
 
-    const result = client.fetch(.{
-        .keep_alive = false,
+    const result = try client.fetch(.{
         .location = .{ .url = url },
         .response_writer = &fw.interface,
         .headers = .{
             .accept_encoding = .{ .override = "identity" },
             .user_agent = .{ .override = "curl/8.7.1 snag/1.0" },
         },
-    }) catch |err| {
-        std.debug.print("error: download failed: {}\n", .{err});
-        return err;
-    };
+    });
 
     if (result.status != .ok) {
         std.debug.print("error: HTTP {d} for {s}\n", .{ @intFromEnum(result.status), url });
@@ -1205,8 +1201,14 @@ fn download(
             var client2 = std.http.Client{ .allocator = allocator, .io = io };
             defer client2.deinit();
             configureHttpClient(&client2);
-            fetchToFile(&client2, io, url, file) catch |e2| return e2;
-        } else return err;
+            fetchToFile(&client2, io, url, file) catch |e2| {
+                std.debug.print("error: download failed: {}\n", .{e2});
+                return e2;
+            };
+        } else {
+            std.debug.print("error: download failed: {}\n", .{err});
+            return err;
+        }
     };
 
     const elapsed = @as(f64, @floatFromInt(nowMonotonicMs(io) - started)) / 1000.0;
