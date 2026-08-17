@@ -44,6 +44,8 @@ snag install  <repo>              Install to ~/.local/snag/bin/
 snag install  <repo> -x <path>    Extract to path, tracked in state
 snag download <repo> [path]       Download asset (default: current dir)
 snag download <repo> -x [path]    Download + extract (default: current dir)
+snag download -repo <repo> [path] Download repository source
+snag install  -repo <repo> [path] Install repository source and track it
 snag update   <repo>              Update installed repo
 snag list                         List installed repos
 snag remove   <repo>              Uninstall repo
@@ -55,7 +57,10 @@ snag remove   <repo>              Uninstall repo
 owner/repo
 https://github.com/owner/repo
 https://github.com/owner/repo/releases
+https://github.com/owner/repo/tree/main/path/to/directory
 ```
+
+Repository and `/tree/<ref>/<directory>` URLs download source only when `-repo` or `--repo` is present. Without it, the existing Release Asset behavior is unchanged.
 
 Short forms: `install`=`i`, `download`=`dl`/`d`, `update`=`up`, `list`=`ls`, `remove`=`rm`
 
@@ -67,6 +72,8 @@ Short forms: `install`=`i`, `download`=`dl`/`d`, `update`=`up`, `list`=`ls`, `re
 | `install -x <path>` | ✅ | Extract to custom path, keep all files |
 | `download` | ❌ | Download asset only. Directory created after successful download |
 | `download -x` | ❌ | Download + extract. Shows all platform assets |
+| `download -repo` | ❌ | Download the whole source tree or a `/tree/...` directory |
+| `install -repo` | ✅ | Install source and track its ref and commit for update/remove |
 | `update` | ✅ | Reads state.json, updates using original install method. Supports short names |
 | `list` | — | List all installed packages |
 | `remove` | ✅ | Recursively deletes install directory, cleans state |
@@ -75,10 +82,11 @@ Short forms: `install`=`i`, `download`=`dl`/`d`, `update`=`up`, `list`=`ls`, `re
 
 | Option | Description |
 |---|---|
-| `-v <tag>` | Release tag (default: latest) |
+| `-v <tag>` | Release tag, or source branch/tag/commit in `-repo` mode |
 | `-m, -s <keyword>` | Asset name filter keyword |
 | `-os <value>` | Platform/arch filter hint |
 | `-i, --interactive` | Force interactive selection |
+| `-repo, --repo` | Download repository source instead of a Release asset |
 | `-h, --help` | Show help |
 
 ## Interactive Selection
@@ -118,6 +126,15 @@ snag download frida/frida ~/Downloads/
 
 # Download + extract
 snag download frida/frida -x
+
+# Download an entire source repository to /tmp/jebmcp
+snag download -repo https://github.com/flankerhqd/jebmcp /tmp/
+
+# Download one source directory to /tmp/jeb_mcp
+snag download -repo https://github.com/flankerhqd/jebmcp/tree/main/jeb-mcp/src/jeb_mcp /tmp/
+
+# Use -v for a source branch/tag/commit (also useful for branch names containing '/')
+snag download -repo -v feature/example https://github.com/owner/repo /tmp/
 
 # Update (short name works)
 snag update ida-mcp-rs

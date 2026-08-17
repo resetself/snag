@@ -35,6 +35,9 @@ const InstallRecord = struct {
     installed_files: []const []const u8, // 安装产生的文件/目录列表
     selected_match_keyword: ?[]const u8, // 记录 -m 关键词（用于 update 时匹配）
     selected_os_arch: ?[]const u8, // 记录 -os 平台标识（用于 update 时匹配）
+    source_ref: ?[]const u8, // 源码模式使用的 branch/tag/commit
+    source_path: ?[]const u8, // 源码模式的仓库内相对目录
+    source_commit: ?[]const u8, // 安装时解析到的 commit SHA
     installed_at: []const u8, // ISO 8601 安装时间戳
 };
 
@@ -64,6 +67,7 @@ const Args = struct {
     output: ?[]const u8 = null, // 自定义输出目录
     extract: bool = false, // -x 解压模式
     interactive: bool = false, // -i 强制交互式选择
+    repo_source: bool = false, // -repo/--repo 下载仓库源码而非 Release Asset
     help: bool = false,
 };
 
@@ -72,6 +76,16 @@ const RepoSlug = struct {
     owner: []const u8,
     name: []const u8,
 };
+
+/// 仓库源码 URL 中解析出的 ref 和子目录。字段均借用原 URL 内存。
+const RepoSourceSpec = struct {
+    slug: RepoSlug,
+    url_ref: ?[]const u8 = null,
+    source_path: ?[]const u8 = null,
+};
+
+const RepoMetadata = struct { default_branch: []const u8 };
+const CommitMetadata = struct { sha: []const u8 };
 
 /// GitHub Release API 响应结构
 const Release = struct {
@@ -328,6 +342,7 @@ fn usage() void {
         \\  snag install  <repo> -x [path]       Extract to path (keep all files)
         \\  snag download <repo> [path]        Download asset (or to path)
         \\  snag download <repo> -x [path]     Download + extract (or to path)
+        \\  snag download -repo <repo> [path]  Download repository source
         \\  snag update   <repo>               Update installed repo
         \\  snag list                          List installed repos
         \\  snag remove   <repo>               Uninstall repo
@@ -337,6 +352,7 @@ fn usage() void {
         \\  -m, -s <keyword>   Match keyword for asset name filtering
         \\  -os <value>        Platform/arch filter hint
         \\  -i, --interactive  Force interactive asset selection
+        \\  -repo, --repo      Download repository source instead of a Release asset
         \\  -h, --help         Show this help message
         \\
         \\Short names: install=i, download=dl/d, update=up, list=ls, remove=rm
@@ -345,6 +361,7 @@ fn usage() void {
         \\  snag install blacktop/ida-mcp-rs
         \\  snag install -m ida-mcp blacktop/ida-mcp-rs -x ./out
         \\  snag download blacktop/ida-mcp-rs -x
+        \\  snag download -repo https://github.com/owner/repo/tree/main/src ./out
         \\  snag update ida-mcp-rs
         \\  snag list
         \\
@@ -391,6 +408,8 @@ fn parseArgs(iter: *std.process.Args.Iterator) Args {
             want_path = true; // -x 后可跟可选路径
         } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--interactive")) {
             args.interactive = true;
+        } else if (std.mem.eql(u8, arg, "-repo") or std.mem.eql(u8, arg, "--repo")) {
+            args.repo_source = true;
         } else if (std.mem.eql(u8, arg, "-u")) {
             args.url = iter.next();
         } else if (std.mem.eql(u8, arg, "install") or std.mem.eql(u8, arg, "i")) {
@@ -426,6 +445,16 @@ fn validateArgs(args: Args) !void {
         usage();
         std.debug.print("\nerror: repository required\n", .{});
         return error.InvalidArgs;
+    }
+    if (args.repo_source) {
+        if (args.cmd != .install and args.cmd != .download) {
+            std.debug.print("error: -repo is only supported by install and download\n", .{});
+            return error.InvalidArgs;
+        }
+        if (args.match_keyword != null or args.os_arch != null or args.interactive or args.extract) {
+            std.debug.print("error: -repo cannot be combined with -m/-s, -os, -i, or -x\n", .{});
+            return error.InvalidArgs;
+        }
     }
     if (args.cmd == .download) return;
     if (args.cmd == .update) {
@@ -491,6 +520,49 @@ fn parseRepoSlug(repo: []const u8) !RepoSlug {
     if (owner.len == 0 or name.len == 0) return error.InvalidRepo;
 
     return .{ .owner = owner, .name = name };
+}
+
+/// 解析源码 URL。/tree/<ref>/<path> 中 ref 只占一个 URL path segment。
+fn parseRepoSourceUrl(repo: []const u8) !RepoSourceSpec {
+    var clean = trimTrailingSlashes(repo);
+    const prefixes = &[_][]const u8{ "https://github.com/", "http://github.com/", "github.com/" };
+    for (prefixes) |prefix| {
+        if (std.ascii.startsWithIgnoreCase(clean, prefix)) {
+            clean = clean[prefix.len..];
+            break;
+        }
+    }
+    if (clean.len > 0 and clean[0] == '/') clean = clean[1..];
+
+    var parts = std.mem.splitScalar(u8, clean, '/');
+    const owner = parts.next() orelse return error.InvalidRepo;
+    const raw_name = parts.next() orelse return error.InvalidRepo;
+    var name = raw_name;
+    if (std.ascii.endsWithIgnoreCase(name, ".git")) name = name[0 .. name.len - 4];
+    if (owner.len == 0 or name.len == 0) return error.InvalidRepo;
+
+    const marker = parts.next() orelse return .{ .slug = .{ .owner = owner, .name = name } };
+    if (!std.mem.eql(u8, marker, "tree")) return error.InvalidRepoSourceUrl;
+    const ref = parts.next() orelse return error.InvalidRepoSourceUrl;
+    if (ref.len == 0) return error.InvalidRepoSourceUrl;
+
+    const prefix_len = owner.len + 1 + raw_name.len + "/tree/".len + ref.len;
+    var path: ?[]const u8 = null;
+    if (prefix_len < clean.len) {
+        const rest = clean[prefix_len..];
+        if (rest.len > 1 and rest[0] == '/') path = rest[1..];
+    }
+    if (path) |p| try validateSourcePath(p);
+    return .{ .slug = .{ .owner = owner, .name = name }, .url_ref = ref, .source_path = path };
+}
+
+fn validateSourcePath(path: []const u8) !void {
+    if (path.len == 0 or std.fs.path.isAbsolute(path) or path[0] == '/') return error.InvalidSourcePath;
+    var segments = std.mem.splitScalar(u8, path, '/');
+    while (segments.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, ".."))
+            return error.InvalidSourcePath;
+    }
 }
 
 /// 生成简单键 owner/name
@@ -1040,6 +1112,9 @@ fn parseInstallRecord(allocator: std.mem.Allocator, value: std.json.Value) !Inst
         .installed_files = try parseInstalledFiles(allocator, obj),
         .selected_match_keyword = if (getStringField(obj, "selected_match_keyword")) |kw| try allocator.dupe(u8, kw) else null,
         .selected_os_arch = if (getStringField(obj, "selected_os_arch")) |osa| try allocator.dupe(u8, osa) else null,
+        .source_ref = if (getStringField(obj, "source_ref")) |ref| try allocator.dupe(u8, ref) else null,
+        .source_path = if (getStringField(obj, "source_path")) |path| try allocator.dupe(u8, path) else null,
+        .source_commit = if (getStringField(obj, "source_commit")) |sha| try allocator.dupe(u8, sha) else null,
         .installed_at = try allocator.dupe(u8, getStringField(obj, "installed_at") orelse return error.InvalidStateFormat),
     };
 }
@@ -1054,7 +1129,6 @@ fn parseInstalledFiles(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![
         files[i] = try allocator.dupe(u8, item.string);
     }
     return files;
-
 }
 
 /// 从 JSON 对象中安全提取字符串字段
@@ -1078,6 +1152,9 @@ fn freeRecordFields(allocator: std.mem.Allocator, rec: *InstallRecord) void {
     allocator.free(rec.installed_files);
     if (rec.selected_match_keyword) |kw| allocator.free(kw);
     if (rec.selected_os_arch) |os| allocator.free(os);
+    if (rec.source_ref) |ref| allocator.free(ref);
+    if (rec.source_path) |path| allocator.free(path);
+    if (rec.source_commit) |sha| allocator.free(sha);
     allocator.free(rec.installed_at);
 }
 
@@ -1134,6 +1211,15 @@ fn saveState(state: *const StateFile, io: std.Io, state_path: []const u8) !void 
         } else {
             try buf.appendSlice(gpa, ",\n    \"selected_os_arch\": null");
         }
+        if (rec.source_ref) |ref| {
+            try buf.print(gpa, ",\n    \"source_ref\": \"{s}\"", .{ref});
+        } else try buf.appendSlice(gpa, ",\n    \"source_ref\": null");
+        if (rec.source_path) |path| {
+            try buf.print(gpa, ",\n    \"source_path\": \"{s}\"", .{path});
+        } else try buf.appendSlice(gpa, ",\n    \"source_path\": null");
+        if (rec.source_commit) |sha| {
+            try buf.print(gpa, ",\n    \"source_commit\": \"{s}\"", .{sha});
+        } else try buf.appendSlice(gpa, ",\n    \"source_commit\": null");
 
         try buf.print(gpa, ",\n    \"installed_at\": \"{s}\"\n  }}", .{rec.installed_at});
     }
@@ -1306,7 +1392,9 @@ fn writeFileCb(ptr: [*]u8, size: c_uint, nmemb: c_uint, userdata: ?*anyopaque) c
 /// libcurl 进度回调：实时显示下载速度和大小
 fn xferInfoCb(clientp: ?*anyopaque, dltotal: cURL.curl_off_t, dlnow: cURL.curl_off_t, ultotal: cURL.curl_off_t, ulnow: cURL.curl_off_t) callconv(.c) c_int {
     const ctx: *DlCtx = @ptrCast(@alignCast(clientp));
-    _ = dltotal; _ = ultotal; _ = ulnow;
+    _ = dltotal;
+    _ = ultotal;
+    _ = ulnow;
     if (dlnow == 0) return 0;
     // 每 ~50 次回调才检查一次时间，减少系统调用
     ctx.tick_count += 1;
@@ -1331,7 +1419,7 @@ fn curlDownload(
     path: []const u8,
 ) !void {
     const label = std.fs.path.basename(path);
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.snag-tmp", .{label});
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.snag-tmp", .{path});
     defer allocator.free(tmp_path);
 
     try ensureParentDir(io, path);
@@ -1604,6 +1692,173 @@ fn installAsset(
 }
 
 // ============================================================================
+// 仓库源码下载
+// ============================================================================
+
+fn fetchJsonTyped(comptime T: type, allocator: std.mem.Allocator, io: std.Io, url: []const u8) !std.json.Parsed(T) {
+    const json = try curlGet(allocator, io, url);
+    defer allocator.free(json);
+    return try std.json.parseFromSlice(T, allocator, json, .{ .ignore_unknown_fields = true });
+}
+
+fn resolveSourceRef(allocator: std.mem.Allocator, io: std.Io, spec: RepoSourceSpec, explicit_ref: ?[]const u8) ![]const u8 {
+    if (explicit_ref orelse spec.url_ref) |ref| return try allocator.dupe(u8, ref);
+    const url = try std.fmt.allocPrint(allocator, "https://api.github.com/repos/{s}/{s}", .{ spec.slug.owner, spec.slug.name });
+    defer allocator.free(url);
+    const parsed = fetchJsonTyped(RepoMetadata, allocator, io, url) catch |err| {
+        std.debug.print("error: could not resolve the repository default branch: {}\n", .{err});
+        return err;
+    };
+    defer parsed.deinit();
+    return try allocator.dupe(u8, parsed.value.default_branch);
+}
+
+fn resolveSourceCommit(allocator: std.mem.Allocator, io: std.Io, spec: RepoSourceSpec, ref: []const u8) ![]const u8 {
+    const url = try std.fmt.allocPrint(allocator, "https://api.github.com/repos/{s}/{s}/commits/{s}", .{ spec.slug.owner, spec.slug.name, ref });
+    defer allocator.free(url);
+    const parsed = fetchJsonTyped(CommitMetadata, allocator, io, url) catch |err| {
+        std.debug.print("error: could not resolve source ref '{s}': {}\n", .{ ref, err });
+        return err;
+    };
+    defer parsed.deinit();
+    return try allocator.dupe(u8, parsed.value.sha);
+}
+
+fn sourceRecordKey(allocator: std.mem.Allocator, spec: RepoSourceSpec) ![]const u8 {
+    if (spec.source_path) |path|
+        return try std.fmt.allocPrint(allocator, "{s}/{s}@source:{s}", .{ spec.slug.owner, spec.slug.name, path });
+    return try std.fmt.allocPrint(allocator, "{s}/{s}@source", .{ spec.slug.owner, spec.slug.name });
+}
+
+fn sourceTargetDir(allocator: std.mem.Allocator, io: std.Io, args: Args, spec: RepoSourceSpec) ![]const u8 {
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const parent = if (args.output) |out|
+        if (std.fs.path.isAbsolute(out)) out else try std.fs.path.join(allocator, &.{ cwd, out })
+    else
+        cwd;
+    defer if (args.output != null and !std.fs.path.isAbsolute(args.output.?)) allocator.free(parent);
+    const name = if (spec.source_path) |path| std.fs.path.basename(path) else spec.slug.name;
+    return try std.fs.path.join(allocator, &.{ parent, name });
+}
+
+fn copyTree(allocator: std.mem.Allocator, io: std.Io, source: []const u8, target: []const u8) !void {
+    try ensureDir(io, target);
+    var dir = try std.Io.Dir.cwd().openDir(io, source, .{ .iterate = true });
+    defer dir.close(io);
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        const src = try std.fs.path.join(allocator, &.{ source, entry.name });
+        defer allocator.free(src);
+        const dst = try std.fs.path.join(allocator, &.{ target, entry.name });
+        defer allocator.free(dst);
+        switch (entry.kind) {
+            .directory => try copyTree(allocator, io, src, dst),
+            .file => try runCommand(allocator, io, &.{ "cp", "-f", src, dst }),
+            .sym_link => try runCommand(allocator, io, &.{ "cp", "-f", src, dst }),
+            else => {},
+        }
+    }
+}
+
+fn extractRepoSource(allocator: std.mem.Allocator, io: std.Io, archive: []const u8, staging: []const u8, spec: RepoSourceSpec, target: []const u8) !void {
+    try ensureDir(io, staging);
+    try runCommand(allocator, io, &.{ "tar", "-xzf", archive, "-C", staging });
+
+    var root = try std.Io.Dir.cwd().openDir(io, staging, .{ .iterate = true });
+    defer root.close(io);
+    var iter = root.iterate();
+    const first = (try iter.next(io)) orelse return error.EmptyArchive;
+    if (first.kind != .directory) return error.InvalidArchive;
+    const archive_root = try std.fs.path.join(allocator, &.{ staging, first.name });
+    defer allocator.free(archive_root);
+    const source = if (spec.source_path) |path|
+        try std.fs.path.join(allocator, &.{ archive_root, path })
+    else
+        try allocator.dupe(u8, archive_root);
+    defer allocator.free(source);
+
+    const stat = std.Io.Dir.cwd().statFile(io, source, .{}) catch {
+        std.debug.print("error: source directory '{s}' does not exist\n", .{spec.source_path.?});
+        return error.SourcePathNotFound;
+    };
+    if (stat.kind != .directory) return error.SourcePathNotDirectory;
+    try copyTree(allocator, io, source, target);
+}
+
+fn downloadRepoSource(allocator: std.mem.Allocator, io: std.Io, spec: RepoSourceSpec, ref: []const u8, target: []const u8) !void {
+    const parent = std.fs.path.dirname(target) orelse ".";
+    try ensureDir(io, parent);
+    const archive = try std.fs.path.join(allocator, &.{ parent, ".snag-source.tar.gz" });
+    defer allocator.free(archive);
+    const staging = try std.fs.path.join(allocator, &.{ parent, ".snag-source-staging" });
+    defer allocator.free(staging);
+    std.Io.Dir.cwd().deleteFile(io, archive) catch {};
+    std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, archive) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+
+    const url = try std.fmt.allocPrint(allocator, "https://codeload.github.com/{s}/{s}/tar.gz/{s}", .{ spec.slug.owner, spec.slug.name, ref });
+    defer allocator.free(url);
+    std.debug.print("Downloading source: {s}/{s} ({s})\n", .{ spec.slug.owner, spec.slug.name, ref });
+    try curlDownload(allocator, io, url, archive);
+    try extractRepoSource(allocator, io, archive, staging, spec, target);
+}
+
+fn writeSourceRecord(allocator: std.mem.Allocator, io: std.Io, state: *StateFile, state_path: []const u8, args: Args, spec: RepoSourceSpec, ref: []const u8, commit: []const u8, target: []const u8) !void {
+    const key = try sourceRecordKey(allocator, spec);
+    defer allocator.free(key);
+    const now = try nowUtcString(allocator, io);
+    defer allocator.free(now);
+    const installed = try allocator.alloc([]const u8, 1);
+    installed[0] = try allocator.dupe(u8, std.fs.path.basename(target));
+    const parent = std.fs.path.dirname(target) orelse ".";
+    const record = InstallRecord{
+        .repo_url = try allocator.dupe(u8, args.url.?),
+        .repo_slug = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ spec.slug.owner, spec.slug.name }),
+        .install_dir = try allocator.dupe(u8, parent),
+        .installed_version = try allocator.dupe(u8, commit[0..@min(commit.len, 12)]),
+        .selected_asset_name = try allocator.dupe(u8, std.fs.path.basename(target)),
+        .selected_download_url = try allocator.dupe(u8, args.url.?),
+        .install_mode = try allocator.dupe(u8, if (spec.source_path != null) "repo_subdir" else "repo_archive"),
+        .install_type = try allocator.dupe(u8, "full"),
+        .installed_files = installed,
+        .selected_match_keyword = null,
+        .selected_os_arch = null,
+        .source_ref = try allocator.dupe(u8, ref),
+        .source_path = if (spec.source_path) |path| try allocator.dupe(u8, path) else null,
+        .source_commit = try allocator.dupe(u8, commit),
+        .installed_at = try allocator.dupe(u8, now),
+    };
+    try upsertRecord(state, key, record);
+    try saveState(state, io, state_path);
+}
+
+fn doRepoSource(allocator: std.mem.Allocator, io: std.Io, state_path: []const u8, args: Args) !void {
+    const spec = try parseRepoSourceUrl(args.url.?);
+    const ref = try resolveSourceRef(allocator, io, spec, args.version);
+    defer allocator.free(ref);
+    const target = try sourceTargetDir(allocator, io, args, spec);
+    defer allocator.free(target);
+    try downloadRepoSource(allocator, io, spec, ref, target);
+    if (args.cmd == .install) {
+        const commit = try resolveSourceCommit(allocator, io, spec, ref);
+        defer allocator.free(commit);
+        var state = try loadState(allocator, io, state_path);
+        defer state.deinit();
+        const key = try sourceRecordKey(allocator, spec);
+        defer allocator.free(key);
+        if (findRecord(&state, key)) |old| {
+            const old_target = try std.fs.path.join(allocator, &.{ old.install_dir, old.selected_asset_name });
+            defer allocator.free(old_target);
+            if (!std.mem.eql(u8, old_target, target)) removeRecordFiles(allocator, io, &old);
+        }
+        try writeSourceRecord(allocator, io, &state, state_path, args, spec, ref, commit, target);
+    }
+    std.debug.print("Done: {s}\n", .{target});
+}
+
+// ============================================================================
 // 主流程
 // ============================================================================
 
@@ -1618,6 +1873,27 @@ fn updateOne(
 ) !void {
     const record = findRecord(state, repo_key) orelse return error.NoInstallRecord;
     std.debug.print("Checking {s}...\n", .{repo_key});
+
+    if (std.mem.eql(u8, record.install_mode, "repo_archive") or std.mem.eql(u8, record.install_mode, "repo_subdir")) {
+        var spec = try parseRepoSourceUrl(record.repo_url);
+        spec.source_path = record.source_path;
+        const ref = record.source_ref orelse return error.InvalidStateFormat;
+        const commit = try resolveSourceCommit(allocator, io, spec, ref);
+        defer allocator.free(commit);
+        if (record.source_commit) |old_commit| {
+            if (std.mem.eql(u8, old_commit, commit)) {
+                std.debug.print("  (already up to date)\n", .{});
+                return;
+            }
+        }
+        const target = try std.fs.path.join(allocator, &.{ record.install_dir, record.selected_asset_name });
+        defer allocator.free(target);
+        try downloadRepoSource(allocator, io, spec, ref, target);
+        var source_args = args;
+        source_args.url = record.repo_url;
+        try writeSourceRecord(allocator, io, state, state_path, source_args, spec, ref, commit, target);
+        return;
+    }
 
     const api_url = repoApiUrl(allocator, record.repo_url, args.version) catch
         try repoApiUrl(allocator, repo_key, args.version);
@@ -1795,8 +2071,7 @@ fn doInstall(
             }
         }
         break :blk try std.fs.path.join(allocator, &.{ cwd_path, dir_name });
-    } else
-        try getInstallDir(allocator, home_dir);
+    } else try getInstallDir(allocator, home_dir);
     defer allocator.free(install_dir);
 
     const full = args.extract; // -x 模式保留全部文件
@@ -1835,10 +2110,8 @@ fn doInstall(
         // 不同资产 → 迁移旧键为 @asset 格式
         try migrateRecordKey(allocator, &old, existing[0], base_key);
         break :blk try assetKey(slug, candidate.name, allocator);
-    } else
-        try assetKey(slug, candidate.name, allocator);
+    } else try assetKey(slug, candidate.name, allocator);
     defer allocator.free(repo_key);
-
 
     try installAsset(allocator, io, candidate, install_dir, !full);
 
@@ -1888,6 +2161,11 @@ fn mainInner(init: std.process.Init) !void {
 
     const state_path = try getStatePath(allocator, home_dir);
     defer allocator.free(state_path);
+
+    if (args.repo_source) {
+        try doRepoSource(allocator, io, state_path, args);
+        return;
+    }
 
     // ---- LIST ----
     if (args.cmd == .list) {
@@ -2053,7 +2331,7 @@ fn mainInner(init: std.process.Init) !void {
             std.debug.print("Downloading: {s}\n", .{candidate.browser_download_url});
             try curlDownload(allocator, io, candidate.browser_download_url, output_path);
         }
-        std.debug.print("Done: {s}\n", .{output_path});
+        if (!args.extract) std.debug.print("Done: {s}\n", .{output_path});
         return;
     }
 
@@ -2101,7 +2379,10 @@ fn diffEntries(allocator: std.mem.Allocator, before: []const []const u8, after: 
     for (after) |name| {
         var found = false;
         for (before) |bname| {
-            if (std.mem.eql(u8, name, bname)) { found = true; break; }
+            if (std.mem.eql(u8, name, bname)) {
+                found = true;
+                break;
+            }
         }
         if (!found) try new_entries.append(allocator, try allocator.dupe(u8, name));
     }
@@ -2151,6 +2432,9 @@ fn writeInstallRecord(
         },
         .selected_match_keyword = if (args.match_keyword) |kw| try allocator.dupe(u8, kw) else null,
         .selected_os_arch = if (args.os_arch) |osa| try allocator.dupe(u8, osa) else null,
+        .source_ref = null,
+        .source_path = null,
+        .source_commit = null,
         .installed_at = try allocator.dupe(u8, now_str),
     };
 
@@ -2163,4 +2447,28 @@ fn writeInstallRecord(
         try upsertRecord(&state, repo_key, record);
         try saveState(&state, io, state_path);
     }
+}
+
+// ============================================================================
+// 单元测试
+// ============================================================================
+
+test "parse repository source URL" {
+    const spec = try parseRepoSourceUrl("https://github.com/flankerhqd/jebmcp");
+    try std.testing.expectEqualStrings("flankerhqd", spec.slug.owner);
+    try std.testing.expectEqualStrings("jebmcp", spec.slug.name);
+    try std.testing.expect(spec.url_ref == null);
+    try std.testing.expect(spec.source_path == null);
+}
+
+test "parse repository subdirectory URL" {
+    const spec = try parseRepoSourceUrl("https://github.com/flankerhqd/jebmcp/tree/main/jeb-mcp/src/jeb_mcp/");
+    try std.testing.expectEqualStrings("main", spec.url_ref.?);
+    try std.testing.expectEqualStrings("jeb-mcp/src/jeb_mcp", spec.source_path.?);
+}
+
+test "reject unsafe repository source paths" {
+    try std.testing.expectError(error.InvalidSourcePath, validateSourcePath("../secret"));
+    try std.testing.expectError(error.InvalidSourcePath, validateSourcePath("src//secret"));
+    try std.testing.expectError(error.InvalidSourcePath, validateSourcePath("src/./secret"));
 }

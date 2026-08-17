@@ -42,6 +42,8 @@ snag install  <repo>              安装到 ~/.local/snag/bin/
 snag install  <repo> -x <path>    解压到 path，写状态
 snag download <repo> [path]       下载资产（默认当前目录）
 snag download <repo> -x [path]    下载 + 解压（默认当前目录）
+snag download -repo <repo> [path] 下载仓库源码
+snag install  -repo <repo> [path] 安装仓库源码并写入状态
 snag update   <repo>              更新已安装
 snag list                         列出已安装
 snag remove   <repo>              卸载
@@ -53,7 +55,10 @@ snag remove   <repo>              卸载
 owner/repo
 https://github.com/owner/repo
 https://github.com/owner/repo/releases
+https://github.com/owner/repo/tree/main/path/to/directory
 ```
+
+只有传入 `-repo` 或 `--repo` 时，仓库 URL 和 `/tree/<ref>/<directory>` URL 才按源码处理。不传该选项时，原有 Release Asset 行为保持不变。
 
 短名：`install`=`i`，`download`=`dl`/`d`，`update`=`up`，`list`=`ls`，`remove`=`rm`
 
@@ -65,6 +70,8 @@ https://github.com/owner/repo/releases
 | `install -x <path>` | ✅ | 解压到自定义路径，保留全部文件 |
 | `download` | ❌ | 仅下载资产包，下载前不创建目录（成功后才建） |
 | `download -x` | ❌ | 下载 + 解压，显示全平台资产 |
+| `download -repo` | ❌ | 下载整个源码仓库或 `/tree/...` 指定目录 |
+| `install -repo` | ✅ | 安装源码，记录 ref 和 commit，支持更新与卸载 |
 | `update` | ✅ | 读取 state.json，按原安装方式更新。支持短名 `snag update jadx` |
 | `list` | — | 列出所有已安装 |
 | `remove` | ✅ | 递归删除安装目录，清理 state |
@@ -73,10 +80,11 @@ https://github.com/owner/repo/releases
 
 | 选项 | 说明 |
 |---|---|
-| `-v <tag>` | 指定版本（默认 latest） |
+| `-v <tag>` | Release 版本；源码模式下表示分支、标签或 commit |
 | `-m, -s <keyword>` | 资产名匹配关键字 |
 | `-os <value>` | 平台/架构过滤提示 |
 | `-i, --interactive` | 强制交互选择 |
+| `-repo, --repo` | 下载仓库源码而不是 Release Asset |
 | `-h, --help` | 帮助 |
 
 ## 交互选择
@@ -116,6 +124,15 @@ snag download frida/frida ~/Downloads/
 
 # 下载 + 解压
 snag download frida/frida -x
+
+# 下载整个源码仓库到 /tmp/jebmcp
+snag download -repo https://github.com/flankerhqd/jebmcp /tmp/
+
+# 下载指定源码目录到 /tmp/jeb_mcp
+snag download -repo https://github.com/flankerhqd/jebmcp/tree/main/jeb-mcp/src/jeb_mcp /tmp/
+
+# -v 可指定源码分支、标签或 commit（也适用于名称包含 '/' 的分支）
+snag download -repo -v feature/example https://github.com/owner/repo /tmp/
 
 # 更新（可短名）
 snag update ida-mcp-rs
