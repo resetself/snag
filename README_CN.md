@@ -76,6 +76,8 @@ https://github.com/owner/repo/tree/main/path/to/directory
 | `list` | — | 列出所有已安装 |
 | `remove` | ✅ | 递归删除安装目录，清理 state |
 
+> **正文链接回退**：部分项目（如 [caido/caido](https://github.com/caido/caido)）的 Release `assets` 数组为空，下载链接以 `[文本](URL)` 形式写在 release 说明里并指向外部域名。当 assets 为空时，snag 会自动从正文中提取可下载产物链接（按扩展名白名单过滤、去重），当作普通资产走同一套评分/选择流程。
+
 ## 选项
 
 | 选项 | 说明 |

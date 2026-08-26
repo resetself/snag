@@ -78,6 +78,8 @@ Short forms: `install`=`i`, `download`=`dl`/`d`, `update`=`up`, `list`=`ls`, `re
 | `list` | — | List all installed packages |
 | `remove` | ✅ | Recursively deletes install directory, cleans state |
 
+> **Body-link fallback:** Some projects (e.g. [caido/caido](https://github.com/caido/caido)) ship an empty Release `assets` array and list download links as `[text](URL)` markdown in the release notes, pointing to an external domain. When assets are empty, snag automatically extracts artifact links from the notes body (extension whitelist + dedup) and feeds them through the same scoring/selection pipeline.
+
 ## Options
 
 | Option | Description |

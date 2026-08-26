@@ -91,6 +91,9 @@ const CommitMetadata = struct { sha: []const u8 };
 const Release = struct {
     tag_name: []const u8,
     assets: []const ReleaseAsset,
+    /// Release 正文（changelog）。部分项目（如 caido/caido）assets 数组为空，
+    /// 真实下载链接以 markdown 链接形式写在正文中并指向外部域名。
+    body: ?[]const u8 = null,
 };
 
 /// Release 中的单个资产
@@ -116,7 +119,7 @@ const empty_aliases = [_][]const u8{};
 // ============================================================================
 
 // OS 别名表
-const os_macos = [_][]const u8{ "darwin", "macos", "osx" };
+const os_macos = [_][]const u8{ "darwin", "macos", "osx", "mac" };
 const os_linux = [_][]const u8{ "linux", "gnu/linux" };
 const os_windows = [_][]const u8{ "windows", "win32", "win64", "mingw" };
 
@@ -127,8 +130,8 @@ const arch_x86 = [_][]const u8{ "x86", "386", "i386", "i686" };
 
 // 不兼容 OS 表：匹配到这些 OS 别名则排除该资产
 const other_os_for_macos = [_][]const u8{ "linux", "windows", "win32", "win64", "mingw", "android" };
-const other_os_for_linux = [_][]const u8{ "darwin", "macos", "osx", "windows", "win32", "win64", "mingw", "android" };
-const other_os_for_windows = [_][]const u8{ "darwin", "macos", "osx", "linux", "android" };
+const other_os_for_linux = [_][]const u8{ "darwin", "macos", "osx", "mac", "windows", "win32", "win64", "mingw", "android" };
+const other_os_for_windows = [_][]const u8{ "darwin", "macos", "osx", "mac", "linux", "android" };
 
 // 不兼容架构表
 const other_arch_for_arm64 = [_][]const u8{
@@ -685,6 +688,96 @@ fn parseRelease(allocator: std.mem.Allocator, json: []const u8) !std.json.Parsed
         std.debug.print("error: failed to parse API response: {}\n", .{err});
         return err;
     };
+}
+
+// ============================================================================
+// Release 正文资产提取 — 部分项目把下载链接写在 release 正文中
+// ============================================================================
+
+/// 可从正文链接中接受的下载产物扩展名白名单
+const body_asset_extensions = [_][]const u8{
+    ".tar.gz", ".tar.xz", ".tar.bz2", ".tgz",  ".tbz",  ".txz",
+    ".zip",    ".xz",     ".gz",      ".bz2",  ".zst",  ".zstd",
+    ".7z",     ".rar",    ".dmg",     ".pkg",  ".exe",  ".msi",
+    ".deb",    ".rpm",    ".appimage", ".apk",  ".jar",  ".bin",
+};
+
+/// 判断 URL basename 是否为可下载的发布产物
+fn isDownloadableFilename(base: []const u8) bool {
+    for (body_asset_extensions) |ext| {
+        if (std.ascii.endsWithIgnoreCase(base, ext)) return !isMetadataFile(base);
+    }
+    return false;
+}
+
+/// 从 Release 正文（changelog）中提取下载资产。
+/// 扫描 markdown 链接 `[text](url)`，按扩展名白名单过滤，按 URL 去重。
+/// 返回 null 表示正文中没有可用下载链接；非 null 时返回值由调用者释放。
+fn extractBodyAssets(allocator: std.mem.Allocator, release: Release) !?[]ReleaseAsset {
+    const body = release.body orelse return null;
+
+    var list: std.ArrayList(ReleaseAsset) = .empty;
+    errdefer {
+        for (list.items) |a| {
+            allocator.free(a.name);
+            allocator.free(a.browser_download_url);
+        }
+        list.deinit(allocator);
+    }
+
+    var i: usize = 0;
+    while (i < body.len) {
+        // 跳过图片语法 ![alt](...)
+        if (body[i] == '!' and i + 1 < body.len and body[i + 1] == '[') {
+            i += 2;
+            continue;
+        }
+        if (body[i] != '[') {
+            i += 1;
+            continue;
+        }
+        // 找闭合的 "]("（链接文本内不允许换行）
+        var j = i + 1;
+        while (j < body.len and body[j] != ']' and body[j] != '\n') : (j += 1) {}
+        if (j >= body.len or body[j] != ']' or j + 1 >= body.len or body[j + 1] != '(') {
+            i += 1;
+            continue;
+        }
+        const url_start = j + 2;
+        var k = url_start;
+        while (k < body.len and body[k] != ')' and body[k] != '\n') : (k += 1) {}
+        if (k >= body.len or body[k] != ')') {
+            i += 1;
+            continue;
+        }
+        const url = body[url_start..k];
+        i = k + 1;
+
+        // 仅接受 http(s) 绝对链接
+        if (!std.ascii.startsWithIgnoreCase(url, "https://") and
+            !std.ascii.startsWithIgnoreCase(url, "http://")) continue;
+
+        const base = basenameFromUrl(url);
+        if (!isDownloadableFilename(base)) continue;
+
+        // 按 URL 去重
+        var dup = false;
+        for (list.items) |existing| {
+            if (std.mem.eql(u8, existing.browser_download_url, url)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+
+        try list.append(allocator, .{
+            .name = try allocator.dupe(u8, base),
+            .browser_download_url = try allocator.dupe(u8, url),
+        });
+    }
+
+    if (list.items.len == 0) return null;
+    return try list.toOwnedSlice(allocator);
 }
 
 // ============================================================================
@@ -1976,7 +2069,24 @@ fn fetchAndSelect(
 
     const parsed = try parseRelease(allocator, json);
     defer parsed.deinit();
-    const release = parsed.value;
+    var release = parsed.value;
+
+    // assets 为空时回退：从 release 正文提取下载链接（如 caido/caido）
+    var body_assets: ?[]ReleaseAsset = null;
+    defer if (body_assets) |ba| {
+        for (ba) |a| {
+            allocator.free(a.name);
+            allocator.free(a.browser_download_url);
+        }
+        allocator.free(ba);
+    };
+    if (release.assets.len == 0) {
+        body_assets = try extractBodyAssets(allocator, release);
+        if (body_assets) |ba| {
+            std.debug.print("No Release assets; {d} download link(s) found in release notes\n", .{ba.len});
+            release.assets = ba;
+        }
+    }
 
     const platform = if (auto_platform and args.os_arch == null) currentPlatformHints() else null;
     const candidates = try collectCandidates(allocator, release, args.match_keyword, args.os_arch, platform);
@@ -2471,4 +2581,52 @@ test "reject unsafe repository source paths" {
     try std.testing.expectError(error.InvalidSourcePath, validateSourcePath("../secret"));
     try std.testing.expectError(error.InvalidSourcePath, validateSourcePath("src//secret"));
     try std.testing.expectError(error.InvalidSourcePath, validateSourcePath("src/./secret"));
+}
+
+fn freeBodyAssets(assets: []ReleaseAsset) void {
+    const allocator = std.testing.allocator;
+    for (assets) |a| {
+        allocator.free(a.name);
+        allocator.free(a.browser_download_url);
+    }
+    allocator.free(assets);
+}
+
+test "extract download links from release body" {
+    const body = "**CLI**\n\n\u{2022} [Linux x86_64](https://caido.download/releases/v0.58.2/caido-cli-v0.58.2-linux-x86_64.tar.gz)\n" ++
+        "\u{2022} [macOS AArch64](https://caido.download/releases/v0.58.2/caido-cli-v0.58.2-mac-aarch64.zip)\n" ++
+        "View the full list of [changes](https://github.com/caido/caido/milestone/97?closed=1).\n" ++
+        "![badge](https://img.shields.io/badge/build-passing-brightgreen)\n";
+    const release = Release{ .tag_name = "v0.58.2", .assets = &.{}, .body = body };
+
+    const assets = (try extractBodyAssets(std.testing.allocator, release)).?;
+    defer freeBodyAssets(assets);
+
+    // milestone 链接与 badge 图片被过滤，只保留两个下载链接
+    try std.testing.expectEqual(@as(usize, 2), assets.len);
+    try std.testing.expectEqualStrings("caido-cli-v0.58.2-linux-x86_64.tar.gz", assets[0].name);
+    try std.testing.expectEqualStrings(
+        "https://caido.download/releases/v0.58.2/caido-cli-v0.58.2-linux-x86_64.tar.gz",
+        assets[0].browser_download_url,
+    );
+    try std.testing.expectEqualStrings("caido-cli-v0.58.2-mac-aarch64.zip", assets[1].name);
+}
+
+test "dedupe body download links and reject non-artifact urls" {
+    const body = "[a](https://dl.example.com/x/tool-1.0-linux-x86_64.tar.gz)" ++
+        " [b](https://dl.example.com/x/tool-1.0-linux-x86_64.tar.gz)" ++
+        " [docs](https://example.com/docs/intro)" ++
+        " [sig](https://dl.example.com/x/tool-1.0-linux-x86_64.tar.gz.sig)";
+    const release = Release{ .tag_name = "v1.0", .assets = &.{}, .body = body };
+
+    const assets = (try extractBodyAssets(std.testing.allocator, release)).?;
+    defer freeBodyAssets(assets);
+
+    // 重复 URL 去重、无扩展名文档与 .sig 签名被排除
+    try std.testing.expectEqual(@as(usize, 1), assets.len);
+}
+
+test "no downloadable links in body returns null" {
+    const release = Release{ .tag_name = "v1", .assets = &.{}, .body = "See [docs](https://example.com/guide)." };
+    try std.testing.expect((try extractBodyAssets(std.testing.allocator, release)) == null);
 }
